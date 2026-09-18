@@ -1,0 +1,25 @@
+run:
+  output_dir: ../runs/example_benchmark
+  conda_executable: conda
+
+data:
+  marker_adapter_config: ../adapter/marker/celltypegpt.config.json
+  selection:
+    - dataset: Azimuth
+
+methods:
+  cassia:
+    enabled: true
+    environment: cassia
+    model: gpt-4o
+    provider: openai
+    max_workers: 4
+    max_retries: 2
+  gptcelltype:
+    enabled: true
+    environment: gptcelltype
+    model: gpt-4o
+    batch_size: 30
+
+evaluation:
+  type: celltypegpt

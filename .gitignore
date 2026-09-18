@@ -1,0 +1,6 @@
+/src 
+/test
+*.md
+/runs
+
+*/__pycache__/

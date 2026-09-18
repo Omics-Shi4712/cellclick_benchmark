@@ -1,0 +1,18 @@
+run:
+  output_dir: ../runs/azimuth_full_gptcelltype_normalized
+  conda_executable: conda
+
+data:
+  marker_adapter_config: ../adapter/marker/celltypegpt.config.json
+  selection:
+    - dataset: Azimuth
+
+methods:
+  gptcelltype:
+    enabled: true
+    environment: gptcelltype
+    model: gpt-4o
+    batch_size: 30
+
+evaluation:
+  type: celltypegpt

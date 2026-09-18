@@ -1,0 +1,2 @@
+marler_list
+ celltypegpt.tsv (supplementary table 4 from https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41592-024-02235-4/MediaObjects/41592_2024_2235_MOESM3_ESM.xlsx; ref: Assessing GPT-4 for cell type annotation in single-cell RNA-seq analysis)
