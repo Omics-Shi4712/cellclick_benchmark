@@ -6,9 +6,13 @@ data:
   marker_adapter_config: ../data/marker_list/celltypegpt/celltype.config.json
   selection:
     - dataset: Azimuth
+  # Optional: remove documented source rows before method tasks and scoring.
+  # exclude_source_row_ids:
+  #   - row_0051
 
-methods:
+callers:
   cassia:
+    implementation: cassia
     enabled: true
     environment: cassia
     model: gpt-4o
@@ -16,10 +20,21 @@ methods:
     max_workers: 4
     max_retries: 2
   gptcelltype:
+    implementation: gptcelltype
     enabled: true
     environment: gptcelltype
     model: gpt-4o
     batch_size: 30
+  # celltypeagent:
+  #   implementation: celltypeagent
+  #   enabled: true
+  #   environment: CellTypeAgent
+  #   # Frozen paper candidates are validated only with --mode test.
+  #   candidate_source: frozen_reproduction
+  #   candidate_file: ../src/CellTypeAgent/Figs/o1-preview (for reproduction)/Azimuth/top_3_max_None.csv
+  #   celltypeagent_code_dir: ../src/CellTypeAgent/CellTypeAgent
+  #   expression_dir: ../data/expression_data/celltypeagent/CELLxGENE
+  #   top_n: 3
 
 evaluation:
   type: celltypegpt

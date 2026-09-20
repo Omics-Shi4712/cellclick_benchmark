@@ -1,0 +1,28 @@
+run:
+  output_dir: ../../runs/azimuth_celltypeagent_frozen
+  conda_executable: conda
+
+data:
+  marker_adapter_config: ../../data/marker_list/celltypeagent/celltypeagent.config.json
+  selection:
+    - dataset: Azimuth
+  exclude_source_row_ids:
+    - row_0051
+
+callers:
+  celltypeagent:
+    implementation: celltypeagent
+    enabled: true
+    environment: CellTypeAgent
+    candidate_source: frozen_reproduction
+    candidate_file: ../src/CellTypeAgent/Figs/o1-preview (for reproduction)/Azimuth/top_3_max_None.csv
+    celltypeagent_code_dir: ../src/CellTypeAgent/CellTypeAgent
+    expression_dir: ../data/expression_data/celltypeagent/CELLxGENE
+    model: o1-preview-frozen+cellxgene-101124
+    top_n: 3
+    max_markers: null
+    tissue_flag: true
+    mixture_strategy: mean
+
+evaluation:
+  type: celltypegpt

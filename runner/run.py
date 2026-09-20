@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run configured cell-type annotation methods in isolated Conda environments."""
+"""Run or reproduce configured cell-type annotation workflows.
+
+``run`` is method-agnostic orchestration: adapter -> caller -> evaluator.
+``test`` dispatches to a method-specific reproduction check under
+``runner.reproduce``.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +33,9 @@ STANDARD_FIELDS = (
     "model",
     "task_id",
 )
-SUPPORTED_METHODS = frozenset({"cassia", "gptcelltype"})
+SUPPORTED_CALLERS = frozenset({"cassia", "celltypeagent", "gptcelltype"})
+# Compatibility alias for downstream code that imported the old constant.
+SUPPORTED_METHODS = SUPPORTED_CALLERS
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -47,24 +55,56 @@ def resolve_path(value: str | Path, config_path: Path) -> Path:
     return path if path.is_absolute() else (config_path.parent / path).resolve()
 
 
-def enabled_methods(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    methods = config.get("methods")
-    if not isinstance(methods, dict):
-        raise ValueError("config.methods must be a mapping")
+def enabled_callers(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return enabled callers, accepting legacy ``methods`` YAML temporarily."""
+    callers = config.get("callers", config.get("methods"))
+    if not isinstance(callers, dict):
+        raise ValueError("config.callers must be a mapping")
     selected: dict[str, dict[str, Any]] = {}
-    for name, settings in methods.items():
-        if name not in SUPPORTED_METHODS:
-            raise ValueError(f"Unsupported method {name!r}; supported: {', '.join(sorted(SUPPORTED_METHODS))}")
+    for name, settings in callers.items():
+        implementation = settings.get("implementation", name) if isinstance(settings, dict) else name
+        if implementation not in SUPPORTED_CALLERS:
+            raise ValueError(f"Unsupported caller {implementation!r}; supported: {', '.join(sorted(SUPPORTED_CALLERS))}")
         if not isinstance(settings, dict):
-            raise ValueError(f"methods.{name} must be a mapping")
+            raise ValueError(f"callers.{name} must be a mapping")
         if settings.get("enabled", True):
             environment = settings.get("environment")
             if not isinstance(environment, str) or not environment.strip():
-                raise ValueError(f"methods.{name}.environment must be a non-empty string")
-            selected[name] = settings
+                raise ValueError(f"callers.{name}.environment must be a non-empty string")
+            selected[name] = {**settings, "implementation": implementation}
     if not selected:
-        raise ValueError("At least one enabled method is required")
+        raise ValueError("At least one enabled caller is required")
     return selected
+
+
+enabled_methods = enabled_callers
+
+
+def excluded_source_row_ids(data: dict[str, Any]) -> set[str]:
+    excluded = data.get("exclude_source_row_ids", [])
+    if not isinstance(excluded, list) or any(not isinstance(row_id, str) or not row_id.strip() for row_id in excluded):
+        raise ValueError("data.exclude_source_row_ids must be a list of non-empty strings")
+    normalized = {row_id.strip() for row_id in excluded}
+    if len(normalized) != len(excluded):
+        raise ValueError("data.exclude_source_row_ids contains duplicates")
+    return normalized
+
+
+def exclude_query_rows(queries: list[Any], excluded_ids: set[str]) -> list[Any]:
+    if not excluded_ids:
+        return queries
+    available_ids = {row.source_row_id for query in queries for row in query.rows}
+    unknown_ids = sorted(excluded_ids - available_ids)
+    if unknown_ids:
+        raise ValueError(f"data.exclude_source_row_ids does not match selected rows: {', '.join(unknown_ids)}")
+    filtered = []
+    for query in queries:
+        rows = tuple(row for row in query.rows if row.source_row_id not in excluded_ids)
+        if rows:
+            filtered.append(replace(query, rows=rows))
+    if not filtered:
+        raise ValueError("data.exclude_source_row_ids removes every selected row")
+    return filtered
 
 
 def select_queries(adapter: Any, selection: Any) -> list[Any]:
@@ -101,7 +141,7 @@ def read_standard_predictions(path: Path, query: Any) -> dict[str, dict[str, str
         raise FileNotFoundError(f"Method did not create prediction TSV: {path}")
     with path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
-    if not rows or not set(STANDARD_FIELDS).issubset(rows[0]):
+    if not rows or set(rows[0]) != set(STANDARD_FIELDS):
         raise ValueError(f"{path} lacks standard prediction fields")
     expected_ids = [row.source_row_id for row in query.rows]
     result = {row["source_row_id"]: row for row in rows}
@@ -109,22 +149,31 @@ def read_standard_predictions(path: Path, query: Any) -> dict[str, dict[str, str
         raise ValueError(f"{path} contains duplicate source_row_id values")
     if set(result) != set(expected_ids):
         raise ValueError(f"{path} source_row_id values do not exactly match its query")
+    if any(not row["prediction"].strip() for row in rows):
+        raise ValueError(f"{path} contains an empty prediction")
+    if any(row["task_id"] != query.task_id for row in rows):
+        raise ValueError(f"{path} contains an unexpected task_id")
     forbidden = {"ground_truth", "clid", "synonyms", "broadtype", "manual annotation"}
     if forbidden & set(rows[0]):
         raise ValueError(f"{path} contains forbidden evaluation columns")
     return result
 
 
-def task_payload(query: Any, method: str, settings: dict[str, Any], output_dir: Path) -> dict[str, Any]:
+def task_payload(query: Any, caller: str, settings: dict[str, Any], output_dir: Path, config_path: Path) -> dict[str, Any]:
     stem = query.task_id.replace("/", "_")
     return {
         "task_id": query.task_id,
+        "config_dir": str(config_path.parent.resolve()),
         "query_tsv": str((output_dir / "inputs" / f"{stem}.tsv").resolve()),
-        "output_tsv": str((output_dir / "predictions" / method / f"{stem}.tsv").resolve()),
-        "work_dir": str((output_dir / "work" / method / stem).resolve()),
+        "output_tsv": str((output_dir / "predictions" / caller / f"{stem}.tsv").resolve()),
+        "work_dir": str((output_dir / "work" / caller / stem).resolve()),
         "tissue_context": query.tissue_context,
-        "method": method,
-        "method_config": {key: value for key, value in settings.items() if key not in {"enabled", "environment"}},
+        "method": caller,
+        "caller": settings["implementation"],
+        "method_config": {
+            key: value for key, value in settings.items()
+            if key not in {"enabled", "environment"} and not key.startswith("reference_")
+        },
     }
 
 
@@ -140,7 +189,8 @@ def prepare_run(config: dict[str, Any], config_path: Path, output_dir: Path) -> 
 
     adapter = MarkerTableAdapter(resolve_path(data["marker_adapter_config"], config_path))
     queries = select_queries(adapter, data.get("selection", []))
-    return adapter, queries, enabled_methods(config)
+    queries = exclude_query_rows(queries, excluded_source_row_ids(data))
+    return adapter, queries, enabled_callers(config)
 
 
 def initialize_output(output_dir: Path, digest: str, resume: bool) -> dict[str, Any]:
@@ -160,7 +210,7 @@ def initialize_output(output_dir: Path, digest: str, resume: bool) -> dict[str, 
     return manifest
 
 
-def invoke_method(method: str, settings: dict[str, Any], task_path: Path, log_path: Path, conda_executable: str) -> None:
+def invoke_caller(caller: str, settings: dict[str, Any], task_path: Path, log_path: Path, conda_executable: str) -> None:
     command = [
         conda_executable,
         "run",
@@ -168,15 +218,17 @@ def invoke_method(method: str, settings: dict[str, Any], task_path: Path, log_pa
         "-n",
         settings["environment"],
         "python",
-        str((Path(__file__).parent / "methods" / f"{method}_runner.py").resolve()),
-        "--task",
+        "-m", "caller.dispatch", "--task",
         str(task_path),
     ]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
         completed = subprocess.run(command, cwd=REPOSITORY_ROOT, stdout=log, stderr=subprocess.STDOUT, text=True)
     if completed.returncode:
-        raise RuntimeError(f"{method} failed with exit code {completed.returncode}; see {log_path}")
+        raise RuntimeError(f"{caller} failed with exit code {completed.returncode}; see {log_path}")
+
+
+invoke_method = invoke_caller
 
 
 def score_tables(adapter: Any, queries: list[Any], methods: dict[str, dict[str, Any]], output_dir: Path, scorer: Any | None = None) -> None:
@@ -244,34 +296,50 @@ def score_tables(adapter: Any, queries: list[Any], methods: dict[str, dict[str, 
         writer.writerows(aggregate_rows)
 
 
-def run(config_path: Path, resume: bool = False, dry_run: bool = False) -> int:
-    config = load_config(config_path)
-    output_setting = config.get("run", {}).get("output_dir") if isinstance(config.get("run", {}), dict) else None
-    if not output_setting:
-        raise ValueError("run.output_dir is required")
-    output_dir = resolve_path(output_setting, config_path)
-    adapter, queries, methods = prepare_run(config, config_path, output_dir)
-    evaluation_type = config.get("evaluation", {}).get("type", "celltypegpt")
-    if evaluation_type == "celltypegpt":
-        from evaluator.scorer.celltypegpt import CellTypeGPTScorer
-        scorer = CellTypeGPTScorer()
-    elif evaluation_type == "cassia":
-        from evaluator.scorer.cassia import CassiaScorer
-        scorer = CassiaScorer()
-    else:
-        raise ValueError("evaluation.type must be 'celltypegpt' or 'cassia'")
-    if dry_run:
-        print(f"Validated {len(queries)} task groups for methods: {', '.join(methods)}")
-        return 0
-    manifest = initialize_output(output_dir, config_digest(config_path), resume)
-    conda_executable = config.get("run", {}).get("conda_executable", "conda")
+def collect_validated_predictions(queries: list[Any], method: str, output_dir: Path) -> dict[str, dict[str, str]]:
+    """Read one method's task outputs after enforcing the shared contract."""
+    collected: dict[str, dict[str, str]] = {}
+    for query in queries:
+        path = output_dir / "predictions" / method / f"{query.task_id.replace('/', '_')}.tsv"
+        collected.update(read_standard_predictions(path, query))
+    return collected
+
+
+def write_combined_predictions(
+    queries: list[Any], method: str, output_dir: Path,
+) -> Path:
+    """Write one label-free, normalized prediction table for a completed method."""
+    predictions = collect_validated_predictions(queries, method, output_dir)
+    path = output_dir / "predictions" / f"{method}.tsv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=STANDARD_FIELDS, delimiter="\t")
+        writer.writeheader()
+        for query in queries:
+            for row in query.rows:
+                writer.writerow(predictions[row.source_row_id])
+    return path
+
+
+def execute_tasks(
+    adapter: Any,
+    queries: list[Any],
+    methods: dict[str, dict[str, Any]],
+    output_dir: Path,
+    config_path: Path,
+    conda_executable: str,
+    manifest: dict[str, Any],
+    *,
+    resume: bool = False,
+) -> int:
+    """Execute callers and record every task result using the normal run contract."""
     failures = 0
     for query in queries:
         input_path = output_dir / "inputs" / f"{query.task_id.replace('/', '_')}.tsv"
         adapter.write_query_tsv(query, input_path)
         for method, settings in methods.items():
             key = f"{method}:{query.task_id}"
-            task = task_payload(query, method, settings, output_dir)
+            task = task_payload(query, method, settings, output_dir, config_path)
             task_path = output_dir / "tasks" / method / f"{query.task_id.replace('/', '_')}.json"
             write_json(task_path, task)
             output_path = Path(task["output_tsv"])
@@ -283,13 +351,110 @@ def run(config_path: Path, resume: bool = False, dry_run: bool = False) -> int:
                 except (FileNotFoundError, ValueError):
                     pass
             try:
-                invoke_method(method, settings, task_path, output_dir / "logs" / method / f"{query.task_id}.log", str(conda_executable))
+                invoke_caller(method, settings, task_path, output_dir / "logs" / method / f"{query.task_id}.log", conda_executable)
                 read_standard_predictions(output_path, query)
                 manifest["tasks"][key] = {"status": "success", "output": str(output_path.relative_to(output_dir))}
             except Exception as error:
                 failures += 1
                 manifest["tasks"][key] = {"status": "failed", "error": str(error)}
             write_json(output_dir / "manifest.json", manifest)
+    return failures
+
+
+def test_output_dir(config: dict[str, Any], config_path: Path) -> Path:
+    run_settings = config.get("run", {})
+    output_setting = run_settings.get("output_dir") if isinstance(run_settings, dict) else None
+    if not output_setting:
+        raise ValueError("run.output_dir is required for --mode test")
+    output_dir = resolve_path(output_setting, config_path)
+    return output_dir.with_name(f"{output_dir.name}_test")
+
+
+def test_reference_files(values: list[str] | None, callers: dict[str, dict[str, Any]]) -> dict[str, str]:
+    if not values:
+        raise ValueError("--reference-file is required with --mode test")
+    if len(callers) == 1 and len(values) == 1 and "=" not in values[0]:
+        return {next(iter(callers)): str(Path(values[0]).expanduser().resolve())}
+    references: dict[str, str] = {}
+    for value in values:
+        caller, separator, path = value.partition("=")
+        if not separator or not caller or not path:
+            raise ValueError("Use --reference-file CALLER=PATH when testing multiple callers")
+        if caller not in callers:
+            raise ValueError(f"--reference-file names an unselected caller: {caller}")
+        if caller in references:
+            raise ValueError(f"--reference-file was supplied more than once for {caller}")
+        references[caller] = str(Path(path).expanduser().resolve())
+    missing = sorted(set(callers) - set(references))
+    if missing:
+        raise ValueError(f"--reference-file is missing for callers: {', '.join(missing)}")
+    return references
+
+
+def run_test(config_path: Path, reference_files: list[str] | None = None) -> int:
+    """Compare method-specific reproduction inputs with user-supplied results."""
+    import importlib
+
+    config = load_config(config_path)
+    output_dir = test_output_dir(config, config_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Reproduction modules decide their execution protocol. GPTCelltype test
+    # mode deliberately invokes its configured caller in the normal Conda env.
+    adapter, queries, callers = prepare_run(config, config_path, output_dir)
+    references = test_reference_files(reference_files, callers)
+    results = []
+    for caller_name, settings in callers.items():
+        implementation = settings["implementation"]
+        module = importlib.import_module(f"runner.reproduce.{implementation}")
+        results.append(module.run(
+            config, adapter, queries, {caller_name: {**settings, "reference_file": references[caller_name]}},
+            config_path, output_dir,
+        ))
+    for result in results:
+        print(
+            f"test validated {result['method']}: "
+            f"{result.get('rows', result.get('tasks', 0))} selected rows/tasks; "
+            f"summary: {result['summary_file']}"
+        )
+    return 0
+
+
+def run(
+    config_path: Path, resume: bool = False, dry_run: bool = False, mode: str = "run",
+    reference_files: list[str] | None = None,
+) -> int:
+    if mode not in {"run", "test"}:
+        raise ValueError("mode must be 'run' or 'test'")
+    if mode == "test":
+        if dry_run:
+            raise ValueError("--dry-run is only valid with --mode run")
+        return run_test(config_path, reference_files)
+    config = load_config(config_path)
+    output_setting = config.get("run", {}).get("output_dir") if isinstance(config.get("run", {}), dict) else None
+    if not output_setting:
+        raise ValueError("run.output_dir is required")
+    output_dir = resolve_path(output_setting, config_path)
+    adapter, queries, methods = prepare_run(config, config_path, output_dir)
+    if dry_run:
+        print(f"Validated {len(queries)} task groups for methods: {', '.join(methods)}")
+        return 0
+    evaluation_type = config.get("evaluation", {}).get("type", "celltypegpt")
+    if evaluation_type == "celltypegpt":
+        from evaluator.scorer.celltypegpt import CellTypeGPTScorer
+        scorer = CellTypeGPTScorer()
+    elif evaluation_type == "cassia":
+        from evaluator.scorer.cassia import CassiaScorer
+        scorer = CassiaScorer()
+    else:
+        raise ValueError("evaluation.type must be 'celltypegpt' or 'cassia'")
+    manifest = initialize_output(output_dir, config_digest(config_path), resume)
+    conda_executable = config.get("run", {}).get("conda_executable", "conda")
+    failures = execute_tasks(
+        adapter, queries, methods, output_dir, config_path, str(conda_executable), manifest, resume=resume,
+    )
+    if not failures:
+        for method in methods:
+            write_combined_predictions(queries, method, output_dir)
     score_tables(adapter, queries, methods, output_dir, scorer)
     return 1 if failures else 0
 
@@ -297,11 +462,19 @@ def run(config_path: Path, resume: bool = False, dry_run: bool = False) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
+    parser.add_argument("--mode", choices=("test", "run"), default="run")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--reference-file", action="append", metavar="[CALLER=]PATH",
+        help="Original result file required by --mode test; repeat as CALLER=PATH for multiple callers",
+    )
     args = parser.parse_args()
     try:
-        raise SystemExit(run(args.config.resolve(), resume=args.resume, dry_run=args.dry_run))
+        raise SystemExit(run(
+            args.config.resolve(), resume=args.resume, dry_run=args.dry_run, mode=args.mode,
+            reference_files=args.reference_file,
+        ))
     except Exception as error:
         print(f"runner error: {error}", file=sys.stderr)
         raise SystemExit(2)

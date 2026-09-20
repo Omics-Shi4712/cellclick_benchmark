@@ -1,14 +1,15 @@
 run:
-  output_dir: ../runs/azimuth_full_cassia
+  output_dir: ../../runs/azimuth_full_cassia
   conda_executable: conda
 
 data:
-  marker_adapter_config: ../data/marker_list/cissia/cassia.config.json
+  marker_adapter_config: ../../data/marker_list/cissia/cassia.config.json
   selection:
     - dataset: Azimuth
 
-methods:
+callers:
   cassia:
+    implementation: cassia
     enabled: true
     environment: cassia
     model: gpt-4o

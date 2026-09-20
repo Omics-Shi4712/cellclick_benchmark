@@ -1,15 +1,15 @@
 run:
-  output_dir: ../runs/azimuth_full_gptcelltype_normalized
+  output_dir: ../../runs/azimuth_full_gptcelltype_normalized
   conda_executable: conda
 
 data:
-  marker_adapter_config: ../data/marker_list/celltypegpt/celltype.config.json
+  marker_adapter_config: ../../data/marker_list/celltypegpt/celltype.config.json
   selection:
     - dataset: Azimuth
+      tissue: PBMC
 
-callers:
+methods:
   gptcelltype:
-    implementation: gptcelltype
     enabled: true
     environment: gptcelltype
     model: gpt-4o

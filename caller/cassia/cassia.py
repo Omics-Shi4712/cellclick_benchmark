@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CASSIA environment-side runner writing the benchmark prediction contract."""
+"""CASSIA annotation and score adapters for the benchmark caller contract."""
 
 from __future__ import annotations
 
@@ -99,11 +99,41 @@ def run_task(task: dict[str, Any]) -> None:
             })
 
 
+def run_score_task(task: dict[str, Any]) -> None:
+    """Score one frozen CASSIA summary without receiving benchmark truth."""
+    import CASSIA
+
+    input_path = Path(task["score_input_csv"])
+    output_path = Path(task["score_output_csv"])
+    if not input_path.is_file():
+        raise FileNotFoundError(f"CASSIA score input not found: {input_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    config = task.get("method_config", {})
+    CASSIA.runCASSIA_score_batch(
+        input_file=str(input_path),
+        output_file=str(output_path),
+        max_workers=int(config.get("max_workers", 4)),
+        model=str(config.get("model", "gpt-4o-2024-08-06")),
+        temperature=float(config.get("temperature", 0)),
+        provider=provider_from_environment(config),
+        max_retries=int(config.get("max_retries", 2)),
+        generate_report=False,
+        conversations_json_path=task.get("conversations_json_path"),
+        reasoning=config.get("reasoning"),
+    )
+    if not output_path.is_file():
+        raise FileNotFoundError(f"CASSIA score output not found: {output_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", required=True, type=Path)
     args = parser.parse_args()
-    run_task(json.loads(args.task.read_text(encoding="utf-8")))
+    task = json.loads(args.task.read_text(encoding="utf-8"))
+    if task.get("action", "annotate") == "score":
+        run_score_task(task)
+    else:
+        run_task(task)
 
 
 if __name__ == "__main__":

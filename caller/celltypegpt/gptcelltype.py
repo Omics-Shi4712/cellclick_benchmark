@@ -12,19 +12,11 @@ from pathlib import Path
 from typing import Any
 
 
-_LEADING_LIST_MARKER = re.compile(r"^\s*(?:[-*•]+|\d+[.)])\s+")
+_LEADING_LIST_MARKER = re.compile(r"^\s*(?:[-*]+|\d+[.)])\s+")
 _PARENTHETICAL_QUALIFIER = re.compile(r"\s*\([^)]*\)")
 
 
 def normalize_prediction(value: object) -> str:
-    """Remove presentation-only list markers from one model annotation.
-
-    GPTCelltype asks for one bare label per line, but current chat models can
-    still return markdown bullets, ordered-list prefixes, or parenthetical
-    explanations.  Those presentation additions are not part of the
-    annotation and prevent the label-only CellTypeGPT evaluator from
-    resolving an otherwise valid term.
-    """
     label = _LEADING_LIST_MARKER.sub("", str(value)).strip()
     return _PARENTHETICAL_QUALIFIER.sub("", label).strip()
 
@@ -63,16 +55,10 @@ def run_task(task: dict[str, Any]) -> None:
         query_path = work_dir / f"batch_{index // batch_size + 1:03d}.tsv"
         prediction_path = work_dir / f"batch_{index // batch_size + 1:03d}.predictions.tsv"
         write_query_batch(batch, query_path)
-        subprocess.run(
-            ["Rscript", str(bridge), str(query_path), str(prediction_path), task["tissue_context"], model],
-            check=True,
-        )
+        subprocess.run(["Rscript", str(bridge), str(query_path), str(prediction_path), task["tissue_context"], model], check=True)
         with prediction_path.open(encoding="utf-8-sig", newline="") as handle:
             result = list(csv.DictReader(handle, delimiter="\t"))
-        by_id = {
-            row.get("source_row_id", ""): normalize_prediction(row.get("prediction", ""))
-            for row in result
-        }
+        by_id = {row.get("source_row_id", ""): normalize_prediction(row.get("prediction", "")) for row in result}
         if set(by_id) != {row["source_row_id"] for row in batch} or any(not value for value in by_id.values()):
             raise ValueError("GPTCelltype batch does not align one-to-one with the query")
         predicted.update(by_id)
@@ -82,10 +68,7 @@ def run_task(task: dict[str, Any]) -> None:
         writer = csv.DictWriter(handle, fieldnames=("source_row_id", "dataset", "tissue", "prediction", "method", "model", "task_id"), delimiter="\t")
         writer.writeheader()
         for row in rows:
-            writer.writerow({
-                "source_row_id": row["source_row_id"], "dataset": row["dataset"], "tissue": row["tissue"],
-                "prediction": predicted[row["source_row_id"]], "method": "gptcelltype", "model": model, "task_id": task["task_id"],
-            })
+            writer.writerow({"source_row_id": row["source_row_id"], "dataset": row["dataset"], "tissue": row["tissue"], "prediction": predicted[row["source_row_id"]], "method": "gptcelltype", "model": model, "task_id": task["task_id"]})
 
 
 def main() -> None:
