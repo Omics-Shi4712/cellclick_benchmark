@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from functools import lru_cache
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -21,6 +22,28 @@ if TYPE_CHECKING:
 
 Score = Optional[float]
 OLS_SEARCH_URL = "https://www.ebi.ac.uk/ols/api/search"
+MAPPING_PATH = Path(__file__).resolve().parents[1] / "ref_data" / "CILO_mapping.json"
+
+
+def _mapping_key(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _load_mapping() -> dict[str, str | None]:
+    if not MAPPING_PATH.is_file():
+        return {}
+    try:
+        payload = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_mapping(mapping: dict[str, str | None]) -> None:
+    MAPPING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = MAPPING_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(mapping, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(MAPPING_PATH)
 
 
 @lru_cache(maxsize=4096)
@@ -61,6 +84,34 @@ def get_cell_type_info(
     )
 
 
+def label_to_cl_id(label: object) -> Optional[str]:
+    """Resolve a natural-language label through the persistent offline cache."""
+    if label is None:
+        return None
+    if not isinstance(label, str) or not label.strip():
+        return None
+    value = label.strip()
+    if value.startswith("CL:"):
+        return value
+    key = _mapping_key(value)
+    mapping = _load_mapping()
+    if key in mapping:
+        result = mapping[key]
+        return result if isinstance(result, str) and result else None
+    cl_id, _ = get_cell_type_info(value)
+    mapping[key] = cl_id
+    _save_mapping(mapping)
+    return cl_id
+
+
+def _resolve_id(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return ""
+    return label_to_cl_id(value)
+
+
 class CassiaScorer:
     """Score CL-ID pairs according to CASSIA's published agreement rule.
 
@@ -86,8 +137,8 @@ class CassiaScorer:
 
     def score_one(self, first_id: object, second_id: object) -> Score:
         """Return ``1.0``, ``0.5``, or ``0.0`` for one CL-ID pair."""
-        first = self._cl_id(first_id)
-        second = self._cl_id(second_id)
+        first = self._cl_id(_resolve_id(first_id))
+        second = self._cl_id(_resolve_id(second_id))
         if first is None or second is None:
             return None
         if not first or not second:
@@ -114,6 +165,19 @@ class CassiaScorer:
             for first_id, second_id in zip(first_ids, second_ids)
         ]
 
+    def score_by_dataset(
+        self, first_ids: Sequence[object], second_ids: Sequence[object], datasets: Sequence[str]
+    ) -> dict[str, Optional[float]]:
+        if len(first_ids) != len(second_ids) or len(first_ids) != len(datasets):
+            raise ValueError("first_ids, second_ids, and datasets must have the same length")
+        grouped: dict[str, list[float]] = {}
+        for first, second, dataset in zip(first_ids, second_ids, datasets):
+            score = self.score_one(first, second)
+            if score is None:
+                return {dataset: None for dataset in sorted(set(datasets))}
+            grouped.setdefault(dataset, []).append(score)
+        return {dataset: sum(values) / len(values) for dataset, values in grouped.items()}
+
 
 @lru_cache(maxsize=1)
 def default_scorer() -> CassiaScorer:
@@ -122,10 +186,10 @@ def default_scorer() -> CassiaScorer:
 
 
 def evaluate_one(first_id: object, second_id: object) -> Score:
-    """Score one CASSIA CL-ID pair using the pinned Cell Ontology."""
+    """Score one pair, resolving natural-language labels to cached CL IDs."""
     return default_scorer().score_one(first_id, second_id)
 
 
 def evaluate(first_ids: Sequence[object], second_ids: Sequence[object]) -> list[Score]:
-    """Score aligned CASSIA CL-ID pairs using the pinned Cell Ontology."""
-    return default_scorer().score(first_ids, second_ids)
+    """Score aligned pairs, resolving labels through the persistent cache."""
+    return [evaluate_one(a, b) for a, b in zip(first_ids, second_ids)]

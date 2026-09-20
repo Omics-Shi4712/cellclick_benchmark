@@ -3,7 +3,7 @@ run:
   conda_executable: conda
 
 data:
-  marker_adapter_config: ../adapter/marker/celltypegpt.config.json
+  marker_adapter_config: ../data/marker_list/celltypegpt/celltype.config.json
   selection:
     - dataset: Azimuth
 

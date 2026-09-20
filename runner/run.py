@@ -130,8 +130,8 @@ def task_payload(query: Any, method: str, settings: dict[str, Any], output_dir: 
 
 def prepare_run(config: dict[str, Any], config_path: Path, output_dir: Path) -> tuple[Any, list[Any], dict[str, dict[str, Any]]]:
     evaluation = config.get("evaluation", {})
-    if not isinstance(evaluation, dict) or evaluation.get("type", "celltypegpt") != "celltypegpt":
-        raise ValueError("Only evaluation.type=celltypegpt is supported")
+    if not isinstance(evaluation, dict) or evaluation.get("type", "celltypegpt") not in {"celltypegpt", "cassia"}:
+        raise ValueError("evaluation.type must be 'celltypegpt' or 'cassia'")
     data = config.get("data")
     if not isinstance(data, dict) or not data.get("marker_adapter_config"):
         raise ValueError("data.marker_adapter_config is required")
@@ -179,10 +179,10 @@ def invoke_method(method: str, settings: dict[str, Any], task_path: Path, log_pa
         raise RuntimeError(f"{method} failed with exit code {completed.returncode}; see {log_path}")
 
 
-def score_tables(adapter: Any, queries: list[Any], methods: dict[str, dict[str, Any]], output_dir: Path) -> None:
-    from evaluator.scorer.celltypegpt import CellTypeGPTScorer
-
-    scorer = CellTypeGPTScorer()
+def score_tables(adapter: Any, queries: list[Any], methods: dict[str, dict[str, Any]], output_dir: Path, scorer: Any | None = None) -> None:
+    if scorer is None:
+        from evaluator.scorer.celltypegpt import CellTypeGPTScorer
+        scorer = CellTypeGPTScorer()
     prediction_maps: dict[str, dict[str, dict[str, str]]] = {}
     for method in methods:
         collected: dict[str, dict[str, str]] = {}
@@ -251,6 +251,15 @@ def run(config_path: Path, resume: bool = False, dry_run: bool = False) -> int:
         raise ValueError("run.output_dir is required")
     output_dir = resolve_path(output_setting, config_path)
     adapter, queries, methods = prepare_run(config, config_path, output_dir)
+    evaluation_type = config.get("evaluation", {}).get("type", "celltypegpt")
+    if evaluation_type == "celltypegpt":
+        from evaluator.scorer.celltypegpt import CellTypeGPTScorer
+        scorer = CellTypeGPTScorer()
+    elif evaluation_type == "cassia":
+        from evaluator.scorer.cassia import CassiaScorer
+        scorer = CassiaScorer()
+    else:
+        raise ValueError("evaluation.type must be 'celltypegpt' or 'cassia'")
     if dry_run:
         print(f"Validated {len(queries)} task groups for methods: {', '.join(methods)}")
         return 0
@@ -281,7 +290,7 @@ def run(config_path: Path, resume: bool = False, dry_run: bool = False) -> int:
                 failures += 1
                 manifest["tasks"][key] = {"status": "failed", "error": str(error)}
             write_json(output_dir / "manifest.json", manifest)
-    score_tables(adapter, queries, methods, output_dir)
+    score_tables(adapter, queries, methods, output_dir, scorer)
     return 1 if failures else 0
 
 

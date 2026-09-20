@@ -3,4 +3,10 @@
 *.md
 /runs
 
-*/__pycache__/
+__pycache__/
+ *.py[cod]
+ */__pycache/
+ */*.py[cod]    
+
+data/*
+!data/readme.txt
