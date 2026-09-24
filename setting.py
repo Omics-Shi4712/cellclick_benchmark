@@ -1,5 +1,6 @@
 ## env_setting
 env_dict = {
+    "base": "cellclcik",
     "cellmaster": "cellmaster",
     "anndict": "adt",
     "CellTypeAgent": "CellTypeAgent",

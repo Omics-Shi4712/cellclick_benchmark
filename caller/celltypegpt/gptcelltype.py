@@ -40,6 +40,10 @@ def write_query_batch(rows: list[dict[str, str]], path: Path) -> None:
 
 
 def run_task(task: dict[str, Any]) -> None:
+    data_adapter = task.get("data_adapter", "tableAdapter")
+    if data_adapter not in {"tableAdapter", "expressionAdapter"}:
+        raise ValueError(f"Unsupported data_adapter {data_adapter!r}")
+    # Both adapters deliberately converge to the same label-free TSV contract.
     rows = read_query(Path(task["query_tsv"]))
     config = task.get("method_config", {})
     batch_size = int(config.get("batch_size", 30))

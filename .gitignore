@@ -1,7 +1,10 @@
-/src 
+/src/*
+!/src/cellclick
 /test
 *.md
+/runner/experiment/
 /runs
+/runs_0923
 
 __pycache__/
  *.py[cod]
