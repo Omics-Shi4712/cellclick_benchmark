@@ -1,8 +1,14 @@
 run:
   output_dir: ../runs/example_benchmark
   conda_executable: conda
+  # Maximum number of independent expression/caller tasks to run concurrently.
+  # Keep this at 1 for serial execution; API callers may need a lower value
+  # than their own method-level worker settings.
+  max_parallel_tasks: 1
 
 data:
+  # Expression marker_method supports wilcoxon-seurat-v2-pos-neg and
+  # wilcoxon-seurat-v2-pos-neutral for balanced class-stratified marker sets.
   tableAdapter:
     marker_adapter_config: ../data/marker_list/celltypegpt/celltype.config.json
     # Optional override; CASSIA otherwise uses data/expression_data/h5ad_metadata.json.
@@ -14,6 +20,14 @@ data:
     #   - row_0051
 
 callers:
+  # anndict:
+  #   # Requires data.expressionAdapter and marker_generator: anndict.
+  #   implementation: anndict
+  #   enabled: true
+  #   environment: adt
+  #   provider: openai
+  #   model: gpt-4o-2024-08-06
+  #   # api_key_env: OPENAI_API_KEY
   cassia:
     implementation: cassia
     enabled: true
@@ -34,16 +48,139 @@ callers:
     # base_url: https://relay.example.com/v1
     # The key stays in this environment variable and is never written to a task.
     # api_key_env: OPENAI_API_KEY
+  # lict:
+  #   # Configuration-driven LICT: each discussion model proposes labels and
+  #   # evaluator_model independently selects the final label.
+  #   implementation: lict
+  #   enabled: true
+  #   environment: lict
+  #   base_url: https://api.openlux.ai/v1
+  #   api_key_env: OPENAI_API_KEY_LLM
+  #   discussion_models:
+  #     - gpt-4o-mini
+  #     - qwen-plus
+  #     - deepseek-v4-flash
+  #   evaluator_model: gpt-4.1-mini
+  #   species: human
+  # cellclick_v1:
+  #   implementation: cellclick_v1
+  #   enabled: true
+  #   environment: cellclick
+  #   # Species is injected from data.expressionAdapter metadata, never YAML.
+  #   protocol_version: v1
+  #   prompt_version: v1
+  #   model: gpt-4o
+  #   annotation_candidates: 5
+  #   max_rounds: 3
+  #   request_retries: 2
+  #   max_parallel_clusters: 1
+  #   # api_key_env: OPENAI_API_KEY
+  # cellclick_v4:
+  #   implementation: cellclick_v4
+  #   enabled: true
+  #   environment: cellclick
+  #   protocol_version: v4.4
+  #   prompt_version: v4.4
+  #   model: gpt-4o
+  #   annotation_candidates: 3
+  #   # V4.2 treats max_rounds as the maximum number of A3 tool-query cycles.
+  #   max_rounds: 5
+  #   request_retries: 2
+  #   max_parallel_clusters: 1
+  #   # api_key_env: OPENAI_API_KEY
+  # cellclick_v4_v45:
+  #   implementation: cellclick_v4
+  #   enabled: true
+  #   environment: cellclick
+  #   protocol_version: v4.5
+  #   prompt_version: v4.5
+  #   model: gpt-4o
+  #   annotation_candidates: 5
+  #   max_rounds: 5
+  #   request_retries: 2
+  #   max_parallel_clusters: 1
+  #   # api_key_env: OPENAI_API_KEY
+  # cellclick_v5:
+  #   implementation: cellclick_v5
+  #   enabled: true
+  #   environment: cellclick
+  #   protocol_version: v5
+  #   prompt_version: v5.10
+  #   max_parallel_clusters: 2
+  #   request_retries: 2
+  #   expression_cache_max_mb: 512
+  #   request_connect_timeout_seconds: 10
+  #   request_read_timeout_seconds: 600
+  #   request_total_timeout_seconds: 610
+  #   verifier_max_rounds: 6
+  #   annotation_candidates: 5
+  #   reference_max: 3
+  #   caller_timeout_seconds: 1800
+  # cellclick_v6:
+  #   implementation: cellclick_v6
+  #   enabled: true
+  #   environment: cellclick
+  #   protocol_version: v6
+  #   prompt_version: v6.12
+  #   annotation_candidates: 5
+  #   request_retries: 2
+  #   max_parallel_clusters: 1
+  #   model: gpt-4o
+  #   llmc_model: gpt-4o
+  #   subtype: true
+  #   cosg_top_n: 50
+  #   verifier_max_rounds: 6
+  #   cellmarker_reference_path: ../src/cellclick/data/cellmarker_reference.tsv
+  #   caller_timeout_seconds: 3600
+  # cellclick_v7:
+  #   implementation: cellclick_v7
+  #   enabled: true
+  #   environment: cellclick
+  #   protocol_version: v7
+  #   prompt_version: v7.1
+  #   model: gpt-4o
+  #   annotation_candidates: 5
+  #   reference_max: 3
+  #   session_max_llm_calls: 8
+  #   finalize_reserved_calls: 2
+  #   request_retries: 2
+  #   max_parallel_clusters: 1
+  #   caller_timeout_seconds: 3600
   # celltypeagent:
   #   implementation: celltypeagent
   #   enabled: true
   #   environment: CellTypeAgent
-  #   # Frozen paper candidates are validated only with --mode test.
-  #   candidate_source: frozen_reproduction
-  #   candidate_file: ../src/CellTypeAgent/Figs/o1-preview (for reproduction)/Azimuth/top_3_max_None.csv
   #   celltypeagent_code_dir: ../src/CellTypeAgent/CellTypeAgent
-  #   expression_dir: ../data/expression_data/celltypeagent/CELLxGENE
+  #   # CellTypeAgent requires data.expressionAdapter; runner injects its
+  #   # generated upstream-compatible expression reference into each task.
+  #   model: gpt-4o
+  #   species: Human
   #   top_n: 3
+  #   max_markers: null
+  #   tissue_flag: true
+  #   mixture_strategy: mean
+  # singler:
+  #   # Requires data.expressionAdapter with target_sum: 10000.
+  #   # Complete example: experiment/test/singler/TS_V1.yaml (partial coverage).
+  #   implementation: singler
+  #   enabled: true
+  #   environment: singler
+  #   hpca_rds: ../src/singler/HPCA_celldex1.0.0.rds
+  #   num_workers: 1
+  #   save_fullpred: true
+  # sctype:
+  #   # Requires expressionAdapter metadata with obs_keys.annotation_group,
+  #   # a human dataset, and clusters that map one-to-one to private truth.
+  #   implementation: sctype
+  #   enabled: true
+  #   environment: sctype
+  #   database_file: ../src/scType/ScTypeDB_full.xlsx
+  #   database_tissue: All
+  #   cell_block_size: 2000
 
 evaluation:
   type: celltypegpt
+  # When type is cassia, ontology similarity is:
+  # 1 / (1 + d1 + d2 + branch_penalty * min(d1, d2)).
+  cassia:
+    branch_penalty: 3.0

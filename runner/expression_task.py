@@ -6,6 +6,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,8 +21,11 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from caller.registry import normalize_caller_name
+
 
 def run_task(task: dict[str, Any]) -> None:
+    _configure_task_caches(task)
     from adapter.expression.expression import ExpressionDataAdapter
 
     expression = task["expression"]
@@ -29,11 +33,12 @@ def run_task(task: dict[str, Any]) -> None:
         task["h5ad"],
         raw_count_layer=expression.get("raw_count_layer", "raw_counts"),
         target_sum=expression.get("target_sum", 10_000.0),
+        protein_coding_only=expression.get("marker_method", "t-test-seurat3") not in {"t-test-seurat3_v2"},
         tissue_column=expression.get("tissue_column", "tissue"),
         cell_type_column=expression.get("cell_type_column", "cell_type"),
     )
     marker_query = adapter.generate_query(
-        "gptcelltype",
+        expression.get("marker_generator", "gptcelltype"),
         groupby=expression["groupby"],
         marker_method=expression.get("marker_method", "t-test-seurat3"),
         marker_top_n=expression.get("marker_top_n", 10),
@@ -47,7 +52,22 @@ def run_task(task: dict[str, Any]) -> None:
     if export is not None:
         if not isinstance(export, dict):
             raise ValueError("annotation_export must be a mapping")
-        _write_annotation_export(adapter, markers, export, expression, task.get("method_exports", {}))
+        _write_annotation_export(
+            adapter, markers, export, expression, task.get("method_exports", {}),
+        )
+
+
+def _configure_task_caches(task: dict[str, Any]) -> None:
+    """Give AnnDictionary/Scanpy a task-local writable cache directory."""
+    work_value = task.get("work_dir")
+    if not isinstance(work_value, str) or not work_value.strip():
+        return
+    cache_dir = Path(work_value) / "runtime_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["NUMBA_CACHE_DIR"] = str(cache_dir / "numba")
+    os.environ["MPLCONFIGDIR"] = str(cache_dir / "matplotlib")
+    Path(os.environ["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+    Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
 
 def _write_annotation_export(
@@ -108,21 +128,64 @@ def _write_annotation_export(
 
 
 def _write_method_exports(
-    adapter: Any, markers: Any, source_by_group: dict[str, str], expression: dict[str, Any], method_exports: dict[str, str],
+    adapter: Any, markers: Any, source_by_group: dict[str, str], expression: dict[str, Any],
+    method_exports: dict[str, str],
 ) -> None:
     """Write caller-specific, label-free expression artifacts."""
     for implementation, output_value in method_exports.items():
         destination = Path(output_value)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if implementation == "gptcelltype":
+        canonical = normalize_caller_name(implementation)
+        if canonical in {"anndict", "gptcelltype", "lict", "cellclick_v1", "cellclick_v2", "cellclick_v3"}:
             with destination.open("w", encoding="utf-8", newline="") as handle:
                 csv.writer(handle).writerow(("source_row_id",))
             continue
-        if implementation == "cassia":
+        if canonical in {"cellclick_v4", "cellclick_v5", "cellclick_v6", "cellclick_v7", "cellclick_v7_2", "cellclick_v7_3"}:
+            v4_groups = {
+                str(group): source_by_group[str(group)]
+                for group in markers["group"].drop_duplicates().tolist()
+            }
+            adapter.generate_query(
+                canonical, groupby=str(expression["groupby"]),
+                marker_method=str(expression.get("marker_method", "t-test-seurat3")),
+                marker_top_n=int(expression.get("marker_top_n", 10)),
+                marker_method_parameters=dict(expression.get("marker_method_parameters", {})),
+                dataname=expression.get("dataname"),
+                marker_statistics_dir=expression.get("marker_statistics_dir"),
+                skip_marker_gene=bool(expression.get("skip_marker_gene", False)),
+                output_path=destination,
+                source_row_id_by_group=v4_groups,
+                manifest_schema_version="cellclick.expression.2",
+            )
+            continue
+        if canonical == "cassia":
             _write_cassia_export(adapter, markers, source_by_group, expression, destination)
             continue
-        if implementation == "celltypeagent":
+        if canonical == "celltypeagent":
             _write_celltypeagent_export(adapter, markers, source_by_group, expression, destination)
+            continue
+        if canonical == "singler":
+            adapter.generate_query(
+                "singler",
+                groupby=str(expression["groupby"]),
+                output_path=destination,
+                source_row_id_by_cell_type={
+                    cell_type: source_by_group[cell_type]
+                    for cell_type in {
+                        str(value).strip()
+                        for value in adapter.adata.obs[adapter.cell_type_column]
+                    }
+                },
+            )
+            continue
+        if canonical == "sctype":
+            groupby = str(expression["groupby"])
+            groups = {str(value).strip() for value in adapter.adata.obs[groupby]}
+            adapter.write_sctype_expression(
+                groupby=groupby,
+                output_path=destination,
+                source_row_id_by_group={group: source_by_group[group] for group in groups},
+            )
             continue
         raise ValueError(f"Expression export is not defined for caller {implementation!r}")
 
@@ -150,32 +213,16 @@ def _write_cassia_export(
 def _write_celltypeagent_export(
     adapter: Any, markers: Any, source_by_group: dict[str, str], expression: dict[str, Any], destination: Path,
 ) -> None:
-    """Export per-submitted-group expression summaries without reference labels."""
-    import numpy as np
-    import pandas as pd
-    from scipy import sparse
+    """Write the upstream CellTypeAgent expression-reference table.
 
-    groupby = str(expression["groupby"])
-    groups = sorted({str(value) for value in adapter.adata.obs[groupby].astype(str)})
-    group_ids = {group: str(index) for index, group in enumerate(groups, start=1)}
+    The table intentionally contains the upstream ``Cell Type`` grouping used
+    by CellTypeAgent expression reranking.  The caller records that reference
+    overlap with the evaluated samples has not been excluded.
+    """
+    del source_by_group
     genes = markers.sort_values("rank", kind="stable")["gene"].drop_duplicates().astype(str).tolist()
-    positions = adapter._gene_positions(adapter.adata.var_names.astype(str), genes)
-    matrix = adapter.adata.layers["normalization+log1p"][:, positions]
-    values = adapter.adata.obs[groupby].astype(str).to_numpy()
-    records = []
-    for group, group_id in group_ids.items():
-        subset = matrix[values == group]
-        size = int((values == group).sum())
-        if sparse.issparse(subset):
-            mean = np.asarray(subset.mean(axis=0)).ravel()
-            fraction = np.asarray(subset.getnnz(axis=0)).ravel() / size
-        else:
-            mean = np.asarray(subset).mean(axis=0)
-            fraction = np.count_nonzero(subset, axis=0) / size
-        for gene, mean_value, fraction_value in zip(genes, mean, fraction):
-            records.append({"source_row_id": source_by_group[group_id], "gene": gene,
-                            "mean_normalized_expression": float(mean_value), "expressed_fraction": float(fraction_value)})
-    pd.DataFrame.from_records(records, columns=("source_row_id", "gene", "mean_normalized_expression", "expressed_fraction")).to_csv(destination, index=False)
+    query = adapter._generate_celltypeagent_query(marker_genes=markers, genes=genes)
+    query.evidence.to_csv(destination, index=False)
 
 
 def expression_groupby(export: dict[str, Any]) -> str:

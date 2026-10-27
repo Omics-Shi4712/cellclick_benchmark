@@ -1,16 +1,34 @@
-/src/*
-!/src/cellclick
-/test
+/src/
+/test/
 *.md
 /runner/experiment/
+!/runner/experiment/
+/runner/experiment/*
+!/runner/experiment/test/
+/runner/experiment/test/*
+!/runner/experiment/test/singler/
+!/runner/experiment/test/singler/TS_V1.yaml
+!/caller/singler/README.md
 /runs
 /runs_0923
 
 __pycache__/
  *.py[cod]
  */__pycache/
- */*.py[cod]    
+*/*.py[cod]
+
+# Local embedding vectors are reusable but too large for the repository.
+/evaluator/embedding_cache/
+
+# Downloaded ontology files and local ontology caches.
+/evaluator/ref_data/uberon.obo
+/evaluator/ref_data/cl.obo
+
+# Local gene list used by expression preprocessing.
+/adapter/expression/protein_coding_genes_list.csv
 
 data/*
-!data/readme.txt
-test/results/
+
+todo
+
+upstream_versions.json

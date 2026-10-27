@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -11,47 +12,58 @@ from runner.reproduce.common import read_reference_rows, resolve_reference_file,
 
 
 REQUIRED_TOP_N = 50
-REFERENCE_MATCH_COLUMNS = ("Dataset", "Tissue", "Marker List")
-REFERENCE_PREDICTION_COLUMN = "Predicted Main Cell Type"
+REFERENCE_CONTEXT_COLUMNS = ("Dataset", "Tissue")
 REFERENCE_EVALUATION_COLUMN = "Evaluation"
 REFERENCE_SCORE_COLUMN = "Score"
-SCORE_TOLERANCE = 1e-6
+REFERENCE_DATASET_ALIASES = {"tsv1": "ts"}
 
 
-def _marker_key(value: str, top_n: int) -> str:
-    genes = [gene.strip() for gene in value.split(",") if gene.strip()]
-    return ",".join(genes[:top_n])
+def _normalize_context_value(value: str) -> str:
+    """Normalize presentation-only variation in historical context names."""
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
 
-def _reference_records(reference_file: Path, queries: list[Any], top_n: int) -> dict[str, dict[str, str]]:
-    """Read the fixed CASSIA reference format after live predictions freeze."""
+def _reference_context(dataset: str, tissue: str) -> tuple[str, str]:
+    normalized_dataset = _normalize_context_value(dataset)
+    return REFERENCE_DATASET_ALIASES.get(normalized_dataset, normalized_dataset), _normalize_context_value(tissue)
+
+
+def _historical_reference_summaries(reference_file: Path, queries: list[Any]) -> dict[tuple[str, str], dict[str, object]]:
+    """Summarize published CASSIA rows by context without matching marker lists.
+
+    Expression-derived queries use independently recomputed markers and cannot
+    be row-matched to the publication's frozen marker table.  The reference is
+    therefore a historical context-level comparator only.
+    """
     rows = read_reference_rows(reference_file)
-    required = {*REFERENCE_MATCH_COLUMNS, REFERENCE_PREDICTION_COLUMN, REFERENCE_EVALUATION_COLUMN, REFERENCE_SCORE_COLUMN}
+    required = {*REFERENCE_CONTEXT_COLUMNS, REFERENCE_EVALUATION_COLUMN, REFERENCE_SCORE_COLUMN}
     missing = required - set(rows[0])
     if missing:
         raise ValueError(f"cassia reference_file lacks required columns: {', '.join(sorted(missing))}")
+    grouped: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        if not row["Dataset"].strip() or not row["Tissue"].strip():
+            raise ValueError("cassia reference_file contains an empty Dataset or Tissue")
+        try:
+            float(row[REFERENCE_EVALUATION_COLUMN])
+            float(row[REFERENCE_SCORE_COLUMN])
+        except (TypeError, ValueError) as error:
+            raise ValueError("cassia reference_file Evaluation and Score must be numeric") from error
+        grouped[_reference_context(row["Dataset"], row["Tissue"])].append(row)
 
-    def key(row: dict[str, str]) -> tuple[str, str, str]:
-        return row["Dataset"].strip(), row["Tissue"].strip(), _marker_key(row["Marker List"], top_n)
-
-    by_key = {key(row): row for row in rows}
-    if len(by_key) != len(rows):
-        raise ValueError("cassia reference_file contains duplicate Dataset/Tissue/Marker List rows")
-    result: dict[str, dict[str, str]] = {}
-    for query in queries:
-        for row in query.rows:
-            reference = by_key.get((row.dataset, row.tissue, row.marker))
-            if reference is None:
-                raise ValueError("cassia reference_file lacks a selected Dataset/Tissue/Marker List row")
-            for column in (REFERENCE_PREDICTION_COLUMN, REFERENCE_EVALUATION_COLUMN, REFERENCE_SCORE_COLUMN):
-                if not reference[column].strip():
-                    raise ValueError(f"cassia reference_file contains an empty {column}")
-            try:
-                float(reference[REFERENCE_EVALUATION_COLUMN])
-                float(reference[REFERENCE_SCORE_COLUMN])
-            except ValueError as error:
-                raise ValueError("cassia reference_file Evaluation and Score must be numeric") from error
-            result[row.source_row_id] = reference
+    selected = {_reference_context(row.dataset, row.tissue) for query in queries for row in query.rows}
+    result: dict[tuple[str, str], dict[str, object]] = {}
+    for context in selected & set(grouped):
+        context_rows = grouped[context]
+        result[context] = {
+            "published_dataset": context_rows[0]["Dataset"].strip(),
+            "published_tissue": context_rows[0]["Tissue"].strip(),
+            "published_rows": len(context_rows),
+            "published_evaluation": sum(float(row[REFERENCE_EVALUATION_COLUMN]) for row in context_rows) / len(context_rows),
+            "published_score": sum(float(row[REFERENCE_SCORE_COLUMN]) for row in context_rows) / len(context_rows),
+        }
+    if not result:
+        raise ValueError("cassia reference_file has no shared dataset/tissue contexts after alias normalization")
     return result
 
 
@@ -76,9 +88,10 @@ def _pipeline_scores(queries: list[Any], caller: str, output_dir: Path) -> dict[
     return scores
 
 
-def _write_evaluations(adapter: Any, queries: list[Any], predictions: dict[str, dict[str, str]], references: dict[str, dict[str, str]], scores: dict[str, float], output_dir: Path) -> tuple[Path, Path]:
+def _write_evaluations(adapter: Any, queries: list[Any], predictions: dict[str, dict[str, str]], reference_summaries: dict[tuple[str, str], dict[str, object]], scores: dict[str, float], output_dir: Path) -> tuple[Path, Path]:
+    """Write live per-row results and shared-context historical summaries."""
     rows: list[dict[str, object]] = []
-    by_dataset: dict[str, list[dict[str, object]]] = defaultdict(list)
+    by_context: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
     for query in queries:
         truth = {record["source_row_id"]: record for record in adapter.evaluation_rows(query)}
         expected = {row.source_row_id for row in query.rows}
@@ -87,45 +100,31 @@ def _write_evaluations(adapter: Any, queries: list[Any], predictions: dict[str, 
         for query_row in query.rows:
             source_row_id = query_row.source_row_id
             prediction = predictions[source_row_id]["prediction"]
-            reference = references[source_row_id]
-            reference_evaluation = float(reference[REFERENCE_EVALUATION_COLUMN])
-            current_score, reference_score = scores[source_row_id], float(reference[REFERENCE_SCORE_COLUMN])
             result = {
                 "dataset": query_row.dataset, "tissue": query_row.tissue, "source_row_id": source_row_id,
                 "ground_truth": truth[source_row_id]["ground_truth"], "cassia_prediction": prediction,
-                "reference_prediction": reference[REFERENCE_PREDICTION_COLUMN].strip(),
-                "prediction_match": prediction == reference[REFERENCE_PREDICTION_COLUMN].strip(),
-                "reference_evaluation": reference_evaluation,
-                "cassia_score": current_score, "reference_score": reference_score,
-                "score_difference": current_score - reference_score,
-                "score_match": abs(current_score - reference_score) <= SCORE_TOLERANCE,
+                "cassia_native_score": scores[source_row_id],
             }
             rows.append(result)
-            by_dataset[query_row.dataset].append(result)
+            by_context[_reference_context(query_row.dataset, query_row.tissue)].append(result)
 
     one_file = output_dir / "evaluation_one.csv"
-    fields = ("dataset", "tissue", "source_row_id", "ground_truth", "cassia_prediction", "reference_prediction", "prediction_match", "reference_evaluation", "cassia_score", "reference_score", "score_difference", "score_match")
+    fields = ("dataset", "tissue", "source_row_id", "ground_truth", "cassia_prediction", "cassia_native_score")
     with one_file.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
 
     aggregate_rows: list[dict[str, object]] = []
-    for dataset in sorted(by_dataset):
-        dataset_rows = by_dataset[dataset]
-        reference_evaluations = [float(row["reference_evaluation"]) for row in dataset_rows]
-        current_scores = [float(row["cassia_score"]) for row in dataset_rows]
-        reference_scores = [float(row["reference_score"]) for row in dataset_rows]
-        reference_evaluation = sum(reference_evaluations) / len(reference_evaluations)
-        current_score, reference_score = sum(current_scores) / len(current_scores), sum(reference_scores) / len(reference_scores)
+    for context in sorted(set(by_context) & set(reference_summaries)):
+        live_rows = by_context[context]
+        published = reference_summaries[context]
         aggregate_rows.append({
-            "dataset": dataset, "reference_evaluate": reference_evaluation,
-            "cassia_score": current_score, "reference_score": reference_score, "score_difference": current_score - reference_score,
-            "prediction_match_rate": sum(bool(row["prediction_match"]) for row in dataset_rows) / len(dataset_rows),
-            "cassia_status": "ok", "reference_status": "ok",
+            "live_rows": len(live_rows), "live_native_score": sum(float(row["cassia_native_score"]) for row in live_rows) / len(live_rows),
+            **published, "comparison_status": "historical_context_only",
         })
     aggregate_file = output_dir / "evaluation.csv"
-    aggregate_fields = ("dataset", "reference_evaluate", "cassia_score", "reference_score", "score_difference", "prediction_match_rate", "cassia_status", "reference_status")
+    aggregate_fields = ("published_dataset", "published_tissue", "live_rows", "live_native_score", "published_rows", "published_evaluation", "published_score", "comparison_status")
     with aggregate_file.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=aggregate_fields)
         writer.writeheader()
@@ -133,8 +132,8 @@ def _write_evaluations(adapter: Any, queries: list[Any], predictions: dict[str, 
     return one_file, aggregate_file
 
 
-def run(config, adapter, queries, callers, config_path, output_dir, *, resume: bool = False):
-    """Run CASSIA, then compare final labels and initial native scores to reference."""
+def run(config, adapter, queries, callers, config_path, output_dir, *, resume: bool = False, force: bool = False, max_parallel_tasks: int = 1):
+    """Run CASSIA and compare shared contexts with historical publication summaries."""
     from runner.run import (
         collect_validated_predictions, config_digest, execute_tasks, initialize_output,
         write_combined_predictions,
@@ -146,11 +145,12 @@ def run(config, adapter, queries, callers, config_path, output_dir, *, resume: b
         adapter_top_n = getattr(adapter, "top_n", None)
         if adapter_top_n is not None and int(adapter_top_n or 0) != REQUIRED_TOP_N:
             raise ValueError(f"CASSIA reproduction requires adapter top_n={REQUIRED_TOP_N}")
-        manifest = initialize_output(output_dir, config_digest(config_path), resume=resume)
+        manifest = initialize_output(output_dir, config_digest(config_path), resume=resume, force=force)
         conda_executable = str(config.get("run", {}).get("conda_executable", "conda"))
         failures = execute_tasks(
             adapter, queries, {name: settings}, output_dir, config_path, conda_executable,
-            manifest, resume=resume,
+            manifest, resume=resume, force=force,
+            max_parallel_tasks=max_parallel_tasks,
         )
         if failures:
             raise RuntimeError(f"cassia test failed for {failures} task(s); see {output_dir / 'manifest.json'}")
@@ -158,8 +158,8 @@ def run(config, adapter, queries, callers, config_path, output_dir, *, resume: b
         predictions = collect_validated_predictions(queries, name, output_dir)
         scores = _pipeline_scores(queries, name, output_dir)
         reference_file = resolve_reference_file(settings, config_path, "cassia")
-        references = _reference_records(reference_file, queries, REQUIRED_TOP_N)
-        evaluation_one_file, evaluation_file = _write_evaluations(adapter, queries, predictions, references, scores, output_dir)
-        summary_file = write_comparison_summary(output_dir, "cassia", prediction_file, reference_file, rows=len(predictions), reference_rows=len(references), reference_id_column="Dataset/Tissue/Marker List", reference_prediction_column=REFERENCE_PREDICTION_COLUMN, comparison="live CASSIA predictions, native scores, and benchmark evaluations")
-        return {"method": "cassia", "tasks": len(queries), "rows": len(predictions), "status": "validated", "prediction_file": str(prediction_file), "evaluation_one_file": str(evaluation_one_file), "evaluation_file": str(evaluation_file), "reference_file": str(reference_file), "summary_file": str(summary_file)}
+        reference_summaries = _historical_reference_summaries(reference_file, queries)
+        evaluation_one_file, evaluation_file = _write_evaluations(adapter, queries, predictions, reference_summaries, scores, output_dir)
+        summary_file = write_comparison_summary(output_dir, "cassia", prediction_file, reference_file, rows=len(predictions), shared_contexts=len(reference_summaries), reference_id_column="Dataset/Tissue (alias-normalized)", comparison="live expression-derived CASSIA run versus published context-level historical summaries; marker lists and predictions are not row-matched")
+        return {"method": "cassia", "tasks": len(queries), "rows": len(predictions), "status": "historical_comparison", "prediction_file": str(prediction_file), "evaluation_one_file": str(evaluation_one_file), "evaluation_file": str(evaluation_file), "reference_file": str(reference_file), "summary_file": str(summary_file)}
     raise ValueError("No CASSIA caller selected")

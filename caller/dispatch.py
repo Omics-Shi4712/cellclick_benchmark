@@ -9,26 +9,21 @@ import json
 from pathlib import Path
 from typing import Any
 
+from caller.registry import AVAILABLE_CALLERS, caller_spec, normalize_caller_name
 
-AVAILABLE_CALLERS = frozenset({"cassia", "celltypeagent", "gptcelltype"})
+
 AVAILABLE_DATA_ADAPTERS = frozenset({"expressionAdapter", "tableAdapter"})
-CALLER_MODULES = {
-    "cassia": "caller.cassia.cassia",
-    "celltypeagent": "caller.celltypeagent.celltypeagent",
-    "gptcelltype": "caller.celltypegpt.gptcelltype",
-}
 
 
 def run_task(task: dict[str, Any]) -> None:
     implementation = task.get("caller") or task.get("method")
-    if not isinstance(implementation, str) or implementation not in AVAILABLE_CALLERS:
-        raise ValueError(f"Unsupported caller {implementation!r}; supported: {', '.join(sorted(AVAILABLE_CALLERS))}")
+    canonical = normalize_caller_name(implementation)
     data_adapter = task.get("data_adapter")
     if data_adapter not in AVAILABLE_DATA_ADAPTERS:
         raise ValueError(
             f"Unsupported data_adapter {data_adapter!r}; supported: {', '.join(sorted(AVAILABLE_DATA_ADAPTERS))}"
         )
-    module = importlib.import_module(CALLER_MODULES[implementation])
+    module = importlib.import_module(caller_spec(canonical)["module"])
     action = task.get("action", "annotate")
     if action == "annotate":
         module.run_task(task)

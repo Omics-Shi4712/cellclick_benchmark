@@ -32,6 +32,22 @@ CELLTYPEAGENT_COLUMNS = (
 DEFAULT_MARKER_WORKERS = 5
 
 
+def _log2fc_class(log2fc: float) -> str:
+    if log2fc >= 0.1:
+        return "positive"
+    if log2fc <= -0.1:
+        return "negative"
+    return "neutral"
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _rank_one_t_test_seurat3_worker(payload: tuple[Any, str, str, int]) -> Any:
     """Rank one group in an isolated process using the fixed t-test protocol."""
     adata, groupby, group, top_n = payload
@@ -64,7 +80,7 @@ def _rank_one_t_test_seurat3_worker(payload: tuple[Any, str, str, int]) -> Any:
     result = result.join(extra, how="left").reset_index(names="gene")
     result = result.loc[
         (result[["pct_in", "pct_rest"]].max(axis=1) >= 0.10)
-        & (result["log2fc"].abs() >= 0.25)
+        & (result["log2fc"] >= 0.25)
         & (result["pvals_adj"] < 0.01)
     ].sort_values(["pvals", "log2fc"], ascending=[True, False], kind="mergesort")
     records = []
@@ -78,11 +94,11 @@ def _rank_one_t_test_seurat3_worker(payload: tuple[Any, str, str, int]) -> Any:
 
 @dataclass(frozen=True)
 class ExpressionQuery:
-    """Label-free marker evidence and the representation for one method.
+    """Expression evidence and the representation for one method.
 
-    ``marker_genes`` always retains the ranking output from
-    :meth:`ExpressionDataAdapter.generate_markers`.  ``evidence`` is the
-    method-specific representation derived from the same selected AnnData.
+    ``marker_genes`` retains the ranking output for marker-based methods and
+    is ``None`` for full-expression methods such as SingleR. ``evidence`` is
+    the method-specific representation derived from the selected AnnData.
     """
 
     marker_genes: Any
@@ -107,6 +123,7 @@ class ExpressionDataAdapter:
         *,
         raw_layers: str | None = None,
         target_sum: float = 10_000.0,
+        protein_coding_only: bool = True,
         tissue_column: str = "tissue",
         cell_type_column: str = "cell_type",
     ) -> None:
@@ -118,10 +135,14 @@ class ExpressionDataAdapter:
         if target_sum <= 0:
             raise ValueError("target_sum must be positive")
 
+        self._source_data = data
         self.adata = self._read_adata(data)
         self.raw_count_layer = resolved_layer
         self.raw_layers = resolved_layer
         self.target_sum = float(target_sum)
+        if not isinstance(protein_coding_only, bool):
+            raise TypeError("protein_coding_only must be boolean")
+        self.protein_coding_only = protein_coding_only
         self.tissue_column = tissue_column
         self.cell_type_column = cell_type_column
         self._genes_before_filter = int(self.adata.shape[1])
@@ -130,12 +151,23 @@ class ExpressionDataAdapter:
         # normalized layers, however, so large h5ad files do not hold full
         # 60k-feature normalized copies in memory.
         self._raw_count_totals = self._raw_count_library_totals()
-        self._filter_protein_coding_genes()
+        if self.protein_coding_only:
+            self._filter_protein_coding_genes()
+        else:
+            self._genes_after_filter = int(self.adata.shape[1])
         self._create_normalized_layers()
         self._generators: dict[str, Callable[..., ExpressionQuery]] = {
+            "anndict": self._generate_anndict_query,
             "celltypeagent": self._generate_celltypeagent_query,
             "cassia": self._generate_cassia_query,
+            "cellclick_v4": self._generate_cellclick_v4_query,
+            "cellclick_v5": self._generate_cellclick_v4_query,
+            "cellclick_v6": self._generate_cellclick_v4_query,
+            "cellclick_v7": self._generate_cellclick_v4_query,
+            "cellclick_v7_2": self._generate_cellclick_v4_query,
+            "cellclick_v7_3": self._generate_cellclick_v4_query,
             "gptcelltype": self._generate_gptcelltype_query,
+            "singler": self._generate_singler_query,
         }
 
     @staticmethod
@@ -219,6 +251,7 @@ class ExpressionDataAdapter:
             "normalized_counts_layer": NORMALIZED_COUNTS_LAYER,
             "normalized_log_layer": NORMALIZED_LOG_LAYER,
             "t_test_seurat3_log_layer": T_TEST_SEURAT3_LOG_LAYER,
+            "protein_coding_only": self.protein_coding_only,
         }
 
     def _create_normalized_layers(self) -> None:
@@ -261,11 +294,12 @@ class ExpressionDataAdapter:
     def generate_markers(
         self, *, groupby: str, method: str = "t-test-seurat3", top_n: int = 10,
         key_added: str | None = None, workers: int = 1, include_statistics: bool = False,
+        include_all_genes: bool = False,
         **method_kwargs: Any,
     ) -> Any:
         """Return ordered top markers for an ``obs`` grouping column.
 
-        ``t-test-seurat3`` and ``wilcoxon-seurat`` apply the fixed TS marker
+        ``t-test-seurat3`` and the Wilcoxon variants apply fixed TS marker
         protocols; ``cosg`` uses the COSG package. No tissue splitting is done
         here.
         """
@@ -278,10 +312,19 @@ class ExpressionDataAdapter:
         if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
             raise ValueError("workers must be a positive integer")
         normalized_method = method.strip().lower() if isinstance(method, str) else ""
-        if normalized_method not in {"t-test-seurat3", "wilcoxon-seurat", "cosg"}:
-            raise ValueError("method must be one of: 't-test-seurat3', 'wilcoxon-seurat', 'cosg'")
+        wilcoxon_methods = {
+            "wilcoxon-seurat", "wilcoxon-seurat-v2",
+            "wilcoxon-seurat-v2-pos-neg", "wilcoxon-seurat-v2-pos-neutral",
+        }
+        if include_all_genes and (workers != 1 or normalized_method not in {"t-test-seurat3", "t-test-seurat3_v2", *wilcoxon_methods}):
+            raise ValueError("include_all_genes requires serial t-test-seurat3 or a Wilcoxon variant")
+        if normalized_method not in {"t-test-seurat3", "t-test-seurat3_v2", *wilcoxon_methods, "cosg"}:
+            raise ValueError("unsupported marker method")
         if self.adata.obs[groupby].dropna().astype(str).nunique() < 2:
             raise ValueError("marker ranking requires at least two non-null groups")
+        missing = self.adata.obs[groupby].isna().to_numpy()
+        if bool(missing.any()):
+            self.adata = self.adata[~missing].copy()
         result_key = key_added or f"expression_markers_{normalized_method.replace('-', '_')}"
         if not isinstance(result_key, str) or not result_key.strip():
             raise ValueError("key_added must be a non-empty string when supplied")
@@ -292,14 +335,35 @@ class ExpressionDataAdapter:
                 )
             return self._rank_markers_t_test_seurat3(
                 groupby=groupby, top_n=top_n, key_added=result_key,
-                include_statistics=include_statistics, **method_kwargs,
+                include_statistics=include_statistics, include_all_genes=include_all_genes, **method_kwargs,
+            )
+        if normalized_method == "t-test-seurat3_v2":
+            if workers != 1:
+                raise ValueError("workers > 1 is not supported for t-test-seurat3_v2")
+            return self._rank_markers_t_test_seurat3_v2(
+                groupby=groupby, top_n=top_n, key_added=result_key,
+                include_statistics=include_statistics, include_all_genes=include_all_genes, **method_kwargs,
             )
         if normalized_method == "wilcoxon-seurat":
             if workers != 1:
                 raise ValueError("workers > 1 is not supported for wilcoxon-seurat")
             return self._rank_markers_wilcoxon_seurat(
                 groupby=groupby, top_n=top_n, key_added=result_key,
-                include_statistics=include_statistics, **method_kwargs,
+                include_statistics=include_statistics, include_all_genes=include_all_genes, **method_kwargs,
+            )
+        if normalized_method == "wilcoxon-seurat-v2":
+            if workers != 1:
+                raise ValueError("workers > 1 is not supported for wilcoxon-seurat-v2")
+            return self._rank_markers_wilcoxon_seurat_v2(
+                groupby=groupby, top_n=top_n, key_added=result_key,
+                include_statistics=include_statistics, include_all_genes=include_all_genes, **method_kwargs,
+            )
+        if normalized_method in {"wilcoxon-seurat-v2-pos-neg", "wilcoxon-seurat-v2-pos-neutral"}:
+            if workers != 1:
+                raise ValueError(f"workers > 1 is not supported for {normalized_method}")
+            return self._rank_markers_wilcoxon_seurat_v2_balanced(
+                groupby=groupby, method=normalized_method, top_n=top_n, key_added=result_key,
+                include_statistics=include_statistics, include_all_genes=include_all_genes, **method_kwargs,
             )
         if workers != 1:
             raise ValueError("workers > 1 is currently supported only for t-test-seurat3")
@@ -323,7 +387,7 @@ class ExpressionDataAdapter:
 
     def _rank_markers_t_test_seurat3(
         self, *, groupby: str, top_n: int, key_added: str,
-        include_statistics: bool = False, **kwargs: Any,
+        include_statistics: bool = False, include_all_genes: bool = False, **kwargs: Any,
     ) -> Any:
         """Run the fixed TS t-test protocol before selecting the requested top N."""
         if kwargs:
@@ -362,12 +426,15 @@ class ExpressionDataAdapter:
             )
             result = sc.get.rank_genes_groups_df(self.adata, group=group, key=key_added)
             result = result.set_index("names").join(extra, how="left").reset_index(names="gene")
-            result = result.loc[
-                (result[["pct_in", "pct_rest"]].max(axis=1) >= 0.10)
-                & (result["log2fc"].abs() >= 0.25)
-                & (result["pvals_adj"] < 0.01)
-            ].sort_values(["pvals", "log2fc"], ascending=[True, False], kind="mergesort")
-            for rank, row in enumerate(result.head(top_n).itertuples(index=False), start=1):
+            if not include_all_genes:
+                result = result.loc[
+                    (result[["pct_in", "pct_rest"]].max(axis=1) >= 0.10)
+                    & (result["log2fc"] >= 0.25)
+                    & (result["pvals_adj"] < 0.01)
+                ]
+            result = result.sort_values(["pvals", "log2fc"], ascending=[True, False], kind="mergesort")
+            selected = result if include_all_genes else result.head(top_n)
+            for rank, row in enumerate(selected.itertuples(index=False), start=1):
                 record = {
                     "groupby": groupby, "group": str(group), "rank": rank,
                     "gene": str(row.gene), "score": float(row.scores), "pvals_adj": float(row.pvals_adj),
@@ -381,9 +448,77 @@ class ExpressionDataAdapter:
         columns = RICH_MARKER_COLUMNS if include_statistics else MARKER_COLUMNS
         return pd.DataFrame.from_records(records, columns=columns)
 
+    def _rank_markers_t_test_seurat3_v2(
+        self, *, groupby: str, top_n: int, key_added: str,
+        include_statistics: bool = False, include_all_genes: bool = False, **kwargs: Any,
+    ) -> Any:
+        """Approximate Seurat 3 FindAllMarkers(test.use='t') with all features.
+
+        Seurat 3 filters rounded detection rates and natural-log fold changes
+        before testing, then applies the adjusted-P return threshold.
+        Scanpy computes the Welch t statistics; a pinned Seurat 3 run is
+        needed to establish exact cross-language numerical agreement.
+        """
+        if kwargs:
+            raise ValueError("t-test-seurat3_v2 does not accept method parameters")
+        if self.protein_coding_only:
+            raise ValueError("t-test-seurat3_v2 requires protein_coding_only=False")
+        try:
+            import numpy as np
+            import pandas as pd
+            import scanpy as sc
+            from scipy import sparse
+        except (ImportError, ValueError) as error:
+            raise RuntimeError("t-test-seurat3_v2 requires scanpy, numpy, pandas, and scipy") from error
+        counts = self.adata.layers[NORMALIZED_COUNTS_LAYER]
+        labels = self.adata.obs[groupby].astype(str).to_numpy()
+        records: list[dict[str, Any]] = []
+        for group in sorted(set(labels)):
+            inside = labels == group
+            outside = ~inside
+            mean_in, pct_in = self._mean_and_detected(counts[inside, :], sparse)
+            mean_out, pct_out = self._mean_and_detected(counts[outside, :], sparse)
+            pct_in, pct_out = np.round(pct_in, 3), np.round(pct_out, 3)
+            logfc = np.log((mean_in + 1.0) / (mean_out + 1.0))
+            eligible = (np.maximum(pct_in, pct_out) > 0.10) & (logfc > 0.25)
+            if not eligible.any():
+                continue
+            subset = self.adata[:, eligible].copy()
+            subset.obs["__benchmark_group__"] = np.where(inside, "target", "rest")
+            sc.tl.rank_genes_groups(
+                subset, groupby="__benchmark_group__", groups=["target"],
+                reference="rest", method="t-test", corr_method="bonferroni",
+                use_raw=False, layer=NORMALIZED_LOG_LAYER,
+                n_genes=subset.n_vars, key_added=key_added,
+            )
+            extra = pd.DataFrame(
+                {"logfc": logfc[eligible], "pct_in": pct_in[eligible], "pct_rest": pct_out[eligible]},
+                index=self.adata.var_names[eligible].astype(str),
+            )
+            result = sc.get.rank_genes_groups_df(subset, group="target", key=key_added)
+            result = result.set_index("names").join(extra, how="left").reset_index(names="gene")
+            result = result.loc[(result["logfc"] > 0.0) & (result["pvals_adj"] < 0.01)]
+            result = result.sort_values(["pvals", "logfc"], ascending=[True, False], kind="mergesort")
+            selected = result if include_all_genes else result.head(top_n)
+            for rank, row in enumerate(selected.itertuples(index=False), start=1):
+                record = {
+                    "groupby": groupby, "group": group, "rank": rank,
+                    "gene": str(row.gene), "score": float(row.scores),
+                    "pvals_adj": float(row.pvals_adj),
+                }
+                if include_statistics:
+                    record.update({
+                        "pvals": float(row.pvals), "log2fc": float(row.logfc / np.log(2.0)),
+                        "pct_in": float(row.pct_in), "pct_rest": float(row.pct_rest),
+                    })
+                records.append(record)
+        return pd.DataFrame.from_records(
+            records, columns=RICH_MARKER_COLUMNS if include_statistics else MARKER_COLUMNS,
+        )
+
     def _rank_markers_wilcoxon_seurat(
         self, *, groupby: str, top_n: int, key_added: str,
-        include_statistics: bool = False, **kwargs: Any,
+        include_statistics: bool = False, include_all_genes: bool = False, **kwargs: Any,
     ) -> Any:
         """Rank TS markers with Scanpy's Wilcoxon implementation.
 
@@ -427,12 +562,15 @@ class ExpressionDataAdapter:
             )
             result = sc.get.rank_genes_groups_df(self.adata, group=group, key=key_added)
             result = result.set_index("names").join(extra, how="left").reset_index(names="gene")
-            result = result.loc[
-                (result[["pct_in", "pct_rest"]].max(axis=1) >= 0.10)
-                & (result["log2fc"].abs() >= 0.25)
-                & (result["pvals_adj"] < 0.01)
-            ].sort_values(["pvals", "log2fc"], ascending=[True, False], kind="mergesort")
-            for rank, row in enumerate(result.head(top_n).itertuples(index=False), start=1):
+            if not include_all_genes:
+                result = result.loc[
+                    (result[["pct_in", "pct_rest"]].max(axis=1) >= 0.10)
+                    & (result["log2fc"] >= 0.25)
+                    & (result["pvals_adj"] < 0.01)
+                ]
+            result = result.sort_values(["pvals", "log2fc"], ascending=[True, False], kind="mergesort")
+            selected = result if include_all_genes else result.head(top_n)
+            for rank, row in enumerate(selected.itertuples(index=False), start=1):
                 record = {
                     "groupby": groupby, "group": str(group), "rank": rank,
                     "gene": str(row.gene), "score": float(row.scores), "pvals_adj": float(row.pvals_adj),
@@ -445,6 +583,135 @@ class ExpressionDataAdapter:
                 records.append(record)
         columns = RICH_MARKER_COLUMNS if include_statistics else MARKER_COLUMNS
         return pd.DataFrame.from_records(records, columns=columns)
+
+    def _rank_markers_wilcoxon_seurat_v2(
+        self, *, groupby: str, top_n: int, key_added: str,
+        include_statistics: bool = False, include_all_genes: bool = False, **kwargs: Any,
+    ) -> Any:
+        """Run a positive-only, reference-like Seurat Wilcoxon protocol.
+
+        The gene universe remains the adapter's protein-coding subset by
+        design. Candidate filtering precedes testing, and only positive
+        log2FC genes are returned.
+        """
+        if kwargs:
+            raise ValueError("wilcoxon-seurat-v2 does not accept method parameters")
+        try:
+            import numpy as np
+            import pandas as pd
+            import scanpy as sc
+            from scipy import sparse
+        except (ImportError, ValueError) as error:
+            raise RuntimeError("wilcoxon-seurat-v2 requires scanpy, numpy, pandas, and scipy") from error
+        counts = self.adata.layers[NORMALIZED_COUNTS_LAYER]
+        labels = self.adata.obs[groupby].astype(str).to_numpy()
+        records: list[dict[str, Any]] = []
+        for group in sorted(set(labels)):
+            inside = labels == group
+            outside = ~inside
+            mean_in, pct_in = self._mean_and_detected(counts[inside, :], sparse)
+            mean_out, pct_out = self._mean_and_detected(counts[outside, :], sparse)
+            log2fc = np.log2((mean_in + 1.0) / (mean_out + 1.0))
+            eligible = (np.maximum(pct_in, pct_out) >= 0.01) & (log2fc >= 0.1)
+            if not eligible.any():
+                continue
+            subset = self.adata[:, eligible].copy()
+            subset.obs["__benchmark_group__"] = np.where(inside, "target", "rest")
+            sc.tl.rank_genes_groups(
+                subset, groupby="__benchmark_group__", groups=["target"],
+                reference="rest", method="wilcoxon", corr_method="bonferroni",
+                use_raw=False, layer=T_TEST_SEURAT3_LOG_LAYER, n_genes=subset.n_vars,
+                key_added=key_added,
+            )
+            extra = pd.DataFrame(
+                {"log2fc": log2fc[eligible], "pct_in": pct_in[eligible], "pct_rest": pct_out[eligible]},
+                index=self.adata.var_names[eligible].astype(str),
+            )
+            result = sc.get.rank_genes_groups_df(subset, group="target", key=key_added)
+            result = result.set_index("names").join(extra, how="left").reset_index(names="gene")
+            result = result.loc[(result["log2fc"] > 0) & (result["pvals_adj"] < 0.01)]
+            result = result.sort_values(["pvals", "log2fc"], ascending=[True, False], kind="mergesort")
+            selected = result if include_all_genes else result.head(top_n)
+            for rank, row in enumerate(selected.itertuples(index=False), start=1):
+                record = {
+                    "groupby": groupby, "group": group, "rank": rank,
+                    "gene": str(row.gene), "score": float(row.scores), "pvals_adj": float(row.pvals_adj),
+                }
+                if include_statistics:
+                    record.update({
+                        "pvals": float(row.pvals), "log2fc": float(row.log2fc),
+                        "pct_in": float(row.pct_in), "pct_rest": float(row.pct_rest),
+                    })
+                records.append(record)
+        columns = RICH_MARKER_COLUMNS if include_statistics else MARKER_COLUMNS
+        return pd.DataFrame.from_records(records, columns=columns)
+
+    def _rank_markers_wilcoxon_seurat_v2_balanced(
+        self, *, groupby: str, method: str, top_n: int, key_added: str,
+        include_statistics: bool = False, include_all_genes: bool = False, **kwargs: Any,
+    ) -> Any:
+        """Select balanced marker sets from Seurat-style log2FC classes."""
+        if kwargs:
+            raise ValueError(f"{method} does not accept method parameters")
+        try:
+            import numpy as np
+            import pandas as pd
+            import scanpy as sc
+            from scipy import sparse
+        except (ImportError, ValueError) as error:
+            raise RuntimeError(f"{method} requires scanpy, numpy, pandas, and scipy") from error
+
+        counts = self.adata.layers[NORMALIZED_COUNTS_LAYER]
+        labels = self.adata.obs[groupby].astype(str).to_numpy()
+        other_class = "negative" if method.endswith("pos-neg") else "neutral"
+        quota = top_n // 2
+        records: list[dict[str, Any]] = []
+        for group in sorted(set(labels)):
+            inside = labels == group
+            outside = ~inside
+            mean_in, pct_in = self._mean_and_detected(counts[inside, :], sparse)
+            mean_out, pct_out = self._mean_and_detected(counts[outside, :], sparse)
+            log2fc = np.log2((mean_in + 1.0) / (mean_out + 1.0))
+            eligible = np.maximum(pct_in, pct_out) >= 0.01
+            if not eligible.any():
+                continue
+            subset = self.adata[:, eligible].copy()
+            subset.obs["__benchmark_group__"] = np.where(inside, "target", "rest")
+            sc.tl.rank_genes_groups(
+                subset, groupby="__benchmark_group__", groups=["target"], reference="rest",
+                method="wilcoxon", corr_method="bonferroni", use_raw=False,
+                layer=T_TEST_SEURAT3_LOG_LAYER, n_genes=subset.n_vars, key_added=key_added,
+            )
+            extra = pd.DataFrame(
+                {"log2fc": log2fc[eligible], "pct_in": pct_in[eligible], "pct_rest": pct_out[eligible]},
+                index=self.adata.var_names[eligible].astype(str),
+            )
+            result = sc.get.rank_genes_groups_df(subset, group="target", key=key_added)
+            result = result.set_index("names").join(extra, how="left").reset_index(names="gene")
+            result = result.loc[result["pvals_adj"] < 0.01].copy()
+            result["gene"] = result["gene"].astype(str)
+            result["_class"] = result["log2fc"].map(_log2fc_class)
+            result = result.sort_values(
+                ["pvals", "log2fc", "gene"], ascending=[True, False, True], kind="mergesort",
+            )
+            chosen = pd.concat([
+                result.loc[result["_class"] == "positive"].head(quota),
+                result.loc[result["_class"] == other_class].head(quota),
+            ], ignore_index=True)
+            for rank, row in enumerate(chosen.itertuples(index=False), start=1):
+                record = {
+                    "groupby": groupby, "group": group, "rank": rank,
+                    "gene": str(row.gene), "score": float(row.scores), "pvals_adj": float(row.pvals_adj),
+                }
+                if include_statistics:
+                    record.update({
+                        "pvals": float(row.pvals), "log2fc": float(row.log2fc),
+                        "pct_in": float(row.pct_in), "pct_rest": float(row.pct_rest),
+                    })
+                records.append(record)
+        return pd.DataFrame.from_records(
+            records, columns=RICH_MARKER_COLUMNS if include_statistics else MARKER_COLUMNS,
+        )
 
     @staticmethod
     def _mean_and_detected(matrix: Any, sparse: Any) -> tuple[Any, Any]:
@@ -509,7 +776,10 @@ class ExpressionDataAdapter:
         ``skip_marker_gene``. The cache retains the real ``cell_type`` for
         offline reference, but loads only numeric ``cell_type_id`` values as
         marker groups for later annotation. ``skip_marker_gene`` supplied by
-        a CLI takes precedence over the config value.
+        a CLI takes precedence over the config value.  Cache reuse is
+        best-effort: when either cache file is missing, markers are computed
+        and a complete cache is written.  Existing complete caches remain
+        subject to strict parameter and content validation.
         """
         if not isinstance(config, Mapping):
             raise TypeError("marker configuration must be a mapping")
@@ -543,7 +813,7 @@ class ExpressionDataAdapter:
             dataname=dataname, groupby=groupby, method=method, top_n=top_n, method_parameters=method_parameters,
             output_ids=output_ids,
         )
-        if use_cache:
+        if use_cache and csv_path.is_file() and metadata_path.is_file():
             return self._read_marker_cache(csv_path, metadata_path, parameters)
         marker_workers = workers if method == "t-test-seurat3" else 1
         markers = self.generate_markers(
@@ -559,8 +829,12 @@ class ExpressionDataAdapter:
     def _marker_cache_paths(cache_dir: Path, dataname: str, method: str, top_n: int) -> tuple[Path, Path]:
         if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n <= 0:
             raise ValueError("marker_top_n must be a positive integer")
-        if method not in {"t-test-seurat3", "wilcoxon-seurat", "cosg"}:
-            raise ValueError("marker_method must be one of: 't-test-seurat3', 'wilcoxon-seurat', 'cosg'")
+        supported_methods = {
+            "t-test-seurat3", "t-test-seurat3_v2", "wilcoxon-seurat", "wilcoxon-seurat-v2",
+            "wilcoxon-seurat-v2-pos-neg", "wilcoxon-seurat-v2-pos-neutral", "cosg",
+        }
+        if method not in supported_methods:
+            raise ValueError("unsupported marker_method")
         stem = f"{dataname}_{method}_{top_n}"
         return cache_dir / f"{stem}.csv", cache_dir / f"{stem}.json"
 
@@ -584,11 +858,19 @@ class ExpressionDataAdapter:
             "normalized_counts_layer": NORMALIZED_COUNTS_LAYER,
             "normalized_log_layer": NORMALIZED_LOG_LAYER,
             "t_test_seurat3_log_layer": T_TEST_SEURAT3_LOG_LAYER,
+            "protein_coding_only": self.protein_coding_only,
+            "t_test_seurat3_v2_protocol": {
+                "gene_universe": "all_raw_count_features",
+                "logfc_base": "e", "min_pct": 0.10,
+                "logfc_threshold": 0.25, "return_thresh_pval": 0.01,
+                "bonferroni_n": "all_features", "sort": ["pvals_asc", "logfc_desc"],
+            },
             "t_test_seurat3_protocol": {
                 "correction": "bonferroni",
                 "min_pct": 0.10,
                 "log2fc_threshold": 0.25,
                 "return_thresh": 0.01,
+                "only_pos": True,
                 "sort": ["pvals_asc", "log2fc_desc"],
             },
             "wilcoxon_seurat_protocol": {
@@ -597,9 +879,33 @@ class ExpressionDataAdapter:
                 "min_pct": 0.10,
                 "log2fc_threshold": 0.25,
                 "return_thresh": 0.01,
+                "only_pos": True,
                 "fold_change": "log2((mean(normalized_counts_in)+1)/(mean(normalized_counts_rest)+1))",
                 "sort": ["pvals_asc", "log2fc_desc"],
             },
+            "wilcoxon_seurat_v2_protocol": {
+                "gene_universe": "protein_coding_features",
+                "normalization": "log2(1 + target_sum * raw_count / cell_library_size)",
+                "test": "scanpy.tl.rank_genes_groups(method='wilcoxon')",
+                "only_pos": True,
+                "min_pct": 0.01,
+                "log2fc_threshold": 0.1,
+                "return_thresh": 0.01,
+                "candidate_filter_before_test": True,
+                "sort": ["pvals_asc", "log2fc_desc"],
+            },
+            **({"wilcoxon_seurat_v2_balanced_protocol": {
+                "gene_universe": "protein_coding_features",
+                "normalization": "log2(1 + target_sum * raw_count / cell_library_size)",
+                "test": "scanpy.tl.rank_genes_groups(method='wilcoxon')",
+                "correction": "bonferroni",
+                "candidate_min_pct": 0.01,
+                "return_thresh": 0.01,
+                "classes": {"positive": "log2fc >= 0.1", "neutral": "-0.1 < log2fc < 0.1", "negative": "log2fc <= -0.1"},
+                "sort": ["pvals_asc", "log2fc_desc", "gene_asc"],
+                "quota": "floor(top_n/2) per selected class; no cross-class fill",
+                "selected_classes": ["positive", "negative"] if method.endswith("pos-neg") else ["positive", "neutral"],
+            }} if method in {"wilcoxon-seurat-v2-pos-neg", "wilcoxon-seurat-v2-pos-neutral"} else {}),
             "n_obs": int(self.adata.shape[0]),
             "n_vars": int(self.adata.shape[1]),
             "var_names_sha256": hashlib.sha256(var_names).hexdigest(),
@@ -680,7 +986,7 @@ class ExpressionDataAdapter:
         workers: int = DEFAULT_MARKER_WORKERS,
         **generator_kwargs: Any,
     ) -> ExpressionQuery:
-        """Generate markers, then derive one method's evidence from them.
+        """Derive one method's evidence, generating markers when required.
 
         ``groupby`` defines the submitted analysis units and must be selected
         by the caller.  It is deliberately required so this adapter never
@@ -700,6 +1006,8 @@ class ExpressionDataAdapter:
             supported = ", ".join(sorted(self._generators))
             raise ValueError(f"Unsupported expression method {method_name!r}; supported: {supported}") from error
         method = method_name.strip().lower()
+        if method == "singler":
+            return generator(marker_genes=None, groupby=groupby, **generator_kwargs)
         if marker_statistics_dir is not None or dataname is not None:
             if not isinstance(marker_statistics_dir, (str, Path)) or not str(marker_statistics_dir).strip():
                 raise ValueError("marker_statistics_dir is required when using marker cache configuration")
@@ -712,8 +1020,6 @@ class ExpressionDataAdapter:
                 "skip_marker_gene": skip_marker_gene,
             }
             if method == "cassia":
-                if marker_method.strip().lower() != "t-test-seurat3":
-                    raise ValueError("CASSIA expression queries require marker_method='t-test-seurat3'")
                 markers = self._generate_cassia_markers_from_config(config, workers=workers)
             else:
                 markers = self.generate_markers_from_config(config, workers=workers)
@@ -721,14 +1027,154 @@ class ExpressionDataAdapter:
             markers = self.generate_markers(
                 groupby=groupby, method=marker_method, top_n=marker_top_n,
                 key_added=marker_key_added,
-                workers=(1 if method == "cassia" or marker_method.strip().lower() in {"cosg", "wilcoxon-seurat"} else workers),
-                include_statistics=(method == "cassia"), **dict(marker_method_parameters),
+                workers=(1 if method == "cassia" or marker_method.strip().lower() in {"cosg", "wilcoxon-seurat", "wilcoxon-seurat-v2", "t-test-seurat3_v2"} else workers),
+                include_statistics=(method == "cassia"), include_all_genes=(method == "cassia"),
+                **dict(marker_method_parameters),
             )
+        if method == "cassia":
+            return generator(marker_genes=markers, top_n=marker_top_n, **generator_kwargs)
+        if method in {"cellclick_v4", "cellclick_v5", "cellclick_v6", "cellclick_v7", "cellclick_v7_2", "cellclick_v7_3"}:
+            return generator(marker_genes=markers, groupby=groupby, **generator_kwargs)
         return generator(marker_genes=markers, **generator_kwargs)
+
+    def _generate_singler_query(
+        self,
+        *,
+        marker_genes: Any,
+        groupby: str,
+        output_path: str | Path,
+        source_row_id_by_cell_type: Mapping[str, str],
+    ) -> ExpressionQuery:
+        """Write full-gene, tissue-level expression using the SingleR protocol."""
+        import h5py
+        import numpy as np
+        import pandas as pd
+        from scipy import sparse
+
+        if marker_genes is not None:
+            raise ValueError("SingleR expression generation does not accept marker genes")
+        if self.target_sum != 10000:
+            raise ValueError("SingleR paper protocol requires target_sum=10000")
+        # The common adapter filters its working AnnData to protein-coding
+        # genes. SingleR instead consumes every source gene, so reopen the
+        # original input rather than exporting ``self.adata``.
+        source = self._read_adata(self._source_data)
+        missing = {self.tissue_column, self.cell_type_column}.difference(source.obs.columns)
+        if missing:
+            raise KeyError(f"adata.obs lacks required column(s): {sorted(missing)}")
+        if groupby != self.cell_type_column:
+            raise ValueError("SingleR groupby must match the configured manual cell-type column")
+        if not source.obs_names.is_unique:
+            raise ValueError("SingleR input contains duplicate cell IDs")
+        if not source.var_names.is_unique:
+            raise ValueError("SingleR input contains duplicate gene names")
+
+        cell_ids = pd.Index(source.obs_names).astype(str).tolist()
+        genes = pd.Index(source.var_names).astype(str).tolist()
+        tissues = source.obs[self.tissue_column]
+        cell_types = source.obs[self.cell_type_column]
+        if tissues.isna().any() or cell_types.isna().any():
+            raise ValueError("SingleR tissue and manual cell-type metadata cannot contain missing values")
+        tissue_values = tissues.astype(str).str.strip().tolist()
+        cell_type_values = cell_types.astype(str).str.strip().tolist()
+        if any(not value for value in cell_ids):
+            raise ValueError("SingleR cell IDs cannot be empty")
+        if any(not value for value in genes):
+            raise ValueError("SingleR gene names cannot be empty")
+        if any(not value for value in tissue_values):
+            raise ValueError("SingleR tissue metadata cannot be empty")
+        if any(not value for value in cell_type_values):
+            raise ValueError("SingleR manual cell-type metadata cannot be empty")
+        if len(set(tissue_values)) != 1:
+            raise ValueError("Each SingleR expression export must contain exactly one tissue")
+        if set(source_row_id_by_cell_type) != set(cell_type_values):
+            raise ValueError("SingleR population mapping does not exactly match manual cell types")
+        if len(set(source_row_id_by_cell_type.values())) != len(source_row_id_by_cell_type):
+            raise ValueError("SingleR population mapping contains duplicate source_row_id values")
+        if any(not isinstance(value, str) or not value.strip() for value in source_row_id_by_cell_type.values()):
+            raise ValueError("SingleR population mapping contains an empty source_row_id")
+
+        if self.raw_count_layer == "X":
+            counts = source.X
+        elif self.raw_count_layer in source.layers:
+            counts = source.layers[self.raw_count_layer]
+        else:
+            raise KeyError(f"Raw count layer {self.raw_count_layer!r} is not present in adata.layers")
+        if counts.shape != source.shape:
+            raise ValueError("raw-count matrix shape must match adata.shape")
+        if sparse.issparse(counts):
+            normalized = counts.astype(np.float64, copy=True).tocsr()
+            if normalized.data.size and (
+                not np.isfinite(normalized.data).all() or (normalized.data < 0).any()
+            ):
+                raise ValueError("raw counts must contain finite, non-negative values")
+            library_sizes = np.asarray(normalized.sum(axis=1)).ravel()
+            if np.any(library_sizes <= 0):
+                raise ValueError("SingleR input contains cells with zero total expression")
+            normalized = sparse.diags(self.target_sum / library_sizes) @ normalized
+            normalized.data = np.log2(normalized.data + 1.0)
+            expression = normalized.transpose().tocsc()
+        else:
+            normalized = np.asarray(counts, dtype=np.float64)
+            if not np.isfinite(normalized).all() or (normalized < 0).any():
+                raise ValueError("raw counts must contain finite, non-negative values")
+            library_sizes = normalized.sum(axis=1)
+            if np.any(library_sizes <= 0):
+                raise ValueError("SingleR input contains cells with zero total expression")
+            normalized = normalized * (self.target_sum / library_sizes)[:, None]
+            expression = sparse.csc_matrix(np.log2(normalized + 1.0).T)
+
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        string_dtype = h5py.string_dtype(encoding="utf-8")
+        try:
+            with h5py.File(temporary, "w") as handle:
+                handle.attrs["schema"] = "ai_cta_singler_expression"
+                handle.attrs["schema_version"] = 2
+                handle.attrs["orientation"] = "genes_by_cells"
+                handle.attrs["normalization"] = "log2(1 + target_sum * raw_count / cell_library_size)"
+                handle.attrs["target_sum"] = self.target_sum
+                handle.attrs["raw_count_layer"] = self.raw_count_layer
+                matrix = handle.create_group("expression")
+                matrix.attrs["format"] = "csc_matrix"
+                matrix.create_dataset("data", data=expression.data, compression="gzip")
+                matrix.create_dataset("indices", data=expression.indices.astype(np.int64), compression="gzip")
+                matrix.create_dataset("indptr", data=expression.indptr.astype(np.int64), compression="gzip")
+                matrix.create_dataset("shape", data=np.asarray(expression.shape, dtype=np.int64))
+                handle.create_dataset("genes", data=np.asarray(genes, dtype=object), dtype=string_dtype)
+                metadata = handle.create_group("meta")
+                metadata.attrs["columns"] = np.asarray(
+                    ("cell_id", "tissue", "source_row_id"), dtype=object,
+                )
+                metadata.create_dataset("cell_id", data=np.asarray(cell_ids, dtype=object), dtype=string_dtype)
+                metadata.create_dataset("tissue", data=np.asarray(tissue_values, dtype=object), dtype=string_dtype)
+                metadata.create_dataset(
+                    "source_row_id",
+                    data=np.asarray([source_row_id_by_cell_type[value] for value in cell_type_values], dtype=object),
+                    dtype=string_dtype,
+                )
+                populations = handle.create_group("populations")
+                populations.create_dataset(
+                    "source_row_id",
+                    data=np.asarray(sorted(source_row_id_by_cell_type.values()), dtype=object),
+                    dtype=string_dtype,
+                )
+            os.replace(temporary, destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        return ExpressionQuery(marker_genes=None, evidence=destination)
 
     def _generate_cassia_markers_from_config(self, config: Mapping[str, Any], *, workers: int) -> Any:
         """Generate or load the rich DE table required by CASSIA."""
         method = str(config.get("marker_method", "t-test-seurat3")).strip().lower()
+        if method not in {"t-test-seurat3", "wilcoxon-seurat", "wilcoxon-seurat-v2"}:
+            raise ValueError(
+                "CASSIA expression queries require a marker method with rich DE statistics: "
+                "'t-test-seurat3', 'wilcoxon-seurat', or 'wilcoxon-seurat-v2'"
+            )
         top_n = config.get("marker_top_n", 10)
         dataname = str(config["dataname"])
         cache_dir = Path(config["marker_statistics_dir"])
@@ -739,12 +1185,22 @@ class ExpressionDataAdapter:
             dataname=dataname, groupby=config["groupby"], method=method, top_n=top_n,
             method_parameters=config.get("marker_method_parameters", {}), output_ids=output_ids,
         )
-        parameters = {**parameters, "output_format": "cassia-rich", "schema_version": 3}
-        if bool(config.get("skip_marker_gene", False)):
-            return self._read_cassia_cache(csv_path, metadata_path, parameters)
+        parameters = {**parameters, "output_format": "cassia-rich", "marker_scope": "all_genes", "schema_version": 4}
+        if (
+            bool(config.get("skip_marker_gene", False))
+            and csv_path.is_file()
+            and metadata_path.is_file()
+        ):
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            cached_parameters = metadata.get("parameters", {})
+            if (
+                cached_parameters.get("schema_version") == 4
+                and cached_parameters.get("marker_scope") == "all_genes"
+            ):
+                return self._read_cassia_cache(csv_path, metadata_path, parameters)
         markers = self.generate_markers(
             groupby=config["groupby"], method=method, top_n=top_n, workers=1,
-            include_statistics=True, **dict(config.get("marker_method_parameters", {})),
+            include_statistics=True, include_all_genes=True, **dict(config.get("marker_method_parameters", {})),
         )
         self._write_cassia_cache(markers, csv_path, metadata_path, parameters)
         return self._read_cassia_cache(csv_path, metadata_path, parameters)
@@ -772,7 +1228,111 @@ class ExpressionDataAdapter:
             raise ValueError(f"CASSIA marker cache lacks required statistics: {csv_path}")
         return cached.loc[:, RICH_MARKER_COLUMNS]
 
-    def _generate_cassia_query(self, *, marker_genes: Any, **kwargs: Any) -> ExpressionQuery:
+    def write_sctype_expression(
+        self,
+        *,
+        groupby: str,
+        output_path: str | Path,
+        source_row_id_by_group: Mapping[str, str],
+    ) -> Path:
+        """Export an anonymous, full-gene CP10K/log1p matrix for ScType.
+
+        The export deliberately reopens the source AnnData, because ScType's
+        input must retain all genes while the common adapter works on a
+        protein-coding subset for marker ranking.
+        """
+        import h5py
+        import numpy as np
+        import pandas as pd
+        from scipy import sparse
+
+        source = self._read_adata(self._source_data)
+        required = {self.tissue_column, groupby}
+        missing = required.difference(source.obs.columns)
+        if missing:
+            raise KeyError(f"adata.obs lacks required column(s): {sorted(missing)}")
+        if not source.obs_names.is_unique or not source.var_names.is_unique:
+            raise ValueError("ScType input requires unique cell IDs and gene names")
+        cell_ids = pd.Index(source.obs_names).astype(str).tolist()
+        genes = pd.Index(source.var_names).astype(str).tolist()
+        tissues = source.obs[self.tissue_column].astype(str).str.strip().tolist()
+        groups = source.obs[groupby].astype(str).str.strip().tolist()
+        if any(not value for value in cell_ids + genes + tissues + groups):
+            raise ValueError("ScType expression identifiers and metadata cannot be empty")
+        if len(set(tissues)) != 1:
+            raise ValueError("Each ScType expression export must contain exactly one tissue")
+        if set(groups) != set(source_row_id_by_group):
+            raise ValueError("ScType population mapping does not exactly match annotation groups")
+        if len(set(source_row_id_by_group.values())) != len(source_row_id_by_group) or any(
+            not isinstance(value, str) or not value.strip() for value in source_row_id_by_group.values()
+        ):
+            raise ValueError("ScType population mapping must contain unique non-empty source_row_id values")
+        if self.raw_count_layer == "X":
+            counts = source.X
+        elif self.raw_count_layer in source.layers:
+            counts = source.layers[self.raw_count_layer]
+        else:
+            raise KeyError(f"Raw count layer {self.raw_count_layer!r} is not present in adata.layers")
+        if counts.shape != source.shape:
+            raise ValueError("raw-count matrix shape must match adata.shape")
+        if sparse.issparse(counts):
+            normalized = counts.astype(np.float64, copy=True).tocsr()
+            if normalized.data.size and (not np.isfinite(normalized.data).all() or (normalized.data < 0).any()):
+                raise ValueError("raw counts must contain finite, non-negative values")
+            totals = np.asarray(normalized.sum(axis=1)).ravel()
+            if np.any(totals <= 0):
+                raise ValueError("ScType input contains cells with zero total expression")
+            normalized = sparse.diags(self.target_sum / totals) @ normalized
+            normalized.data = np.log1p(normalized.data)
+            expression = normalized.transpose().tocsc()
+        else:
+            normalized = np.asarray(counts, dtype=np.float64)
+            if not np.isfinite(normalized).all() or (normalized < 0).any():
+                raise ValueError("raw counts must contain finite, non-negative values")
+            totals = normalized.sum(axis=1)
+            if np.any(totals <= 0):
+                raise ValueError("ScType input contains cells with zero total expression")
+            expression = sparse.csc_matrix(np.log1p(normalized * (self.target_sum / totals)[:, None]).T)
+
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        string_dtype = h5py.string_dtype(encoding="utf-8")
+        try:
+            with h5py.File(temporary, "w") as handle:
+                handle.attrs["schema"] = "ai_cta_sctype_expression"
+                handle.attrs["schema_version"] = 1
+                handle.attrs["orientation"] = "genes_by_cells"
+                handle.attrs["normalization"] = "log1p(target_sum * raw_count / cell_library_size)"
+                handle.attrs["target_sum"] = self.target_sum
+                handle.attrs["raw_count_layer"] = self.raw_count_layer
+                matrix = handle.create_group("expression")
+                matrix.attrs["format"] = "csc_matrix"
+                matrix.create_dataset("data", data=expression.data, compression="gzip")
+                matrix.create_dataset("indices", data=expression.indices.astype(np.int64), compression="gzip")
+                matrix.create_dataset("indptr", data=expression.indptr.astype(np.int64), compression="gzip")
+                matrix.create_dataset("shape", data=np.asarray(expression.shape, dtype=np.int64))
+                handle.create_dataset("genes", data=np.asarray(genes, dtype=object), dtype=string_dtype)
+                metadata = handle.create_group("meta")
+                metadata.create_dataset("cell_id", data=np.asarray(cell_ids, dtype=object), dtype=string_dtype)
+                metadata.create_dataset("tissue", data=np.asarray(tissues, dtype=object), dtype=string_dtype)
+                metadata.create_dataset(
+                    "source_row_id",
+                    data=np.asarray([source_row_id_by_group[group] for group in groups], dtype=object),
+                    dtype=string_dtype,
+                )
+                populations = handle.create_group("populations")
+                populations.create_dataset(
+                    "source_row_id",
+                    data=np.asarray(sorted(source_row_id_by_group.values()), dtype=object), dtype=string_dtype,
+                )
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
+
+    def _generate_cassia_query(self, *, marker_genes: Any, top_n: int = 10, **kwargs: Any) -> ExpressionQuery:
         if kwargs:
             raise TypeError("cassia does not accept expression export options")
         missing = [column for column in ("group", "gene", "log2fc", "pvals_adj", "pct_in", "pct_rest", "pvals") if column not in marker_genes]
@@ -781,12 +1341,144 @@ class ExpressionDataAdapter:
         evidence = marker_genes.loc[:, ["group", "gene", "log2fc", "pvals_adj", "pct_in", "pct_rest", "pvals"]].rename(
             columns={"group": "cluster", "log2fc": "avg_log2FC", "pvals_adj": "p_val_adj", "pct_in": "pct.1", "pct_rest": "pct.2", "pvals": "p_val"}
         )
-        return ExpressionQuery(marker_genes=marker_genes, evidence=evidence.loc[:, CASSIA_MARKER_COLUMNS])
+        selected = marker_genes.loc[
+            (marker_genes[["pct_in", "pct_rest"]].max(axis=1) >= 0.10)
+            & (marker_genes["log2fc"] >= 0.25) & (marker_genes["pvals_adj"] < 0.01)
+        ].copy()
+        selected = selected.groupby("group", sort=False).head(top_n).copy()
+        selected["rank"] = selected.groupby("group", sort=False).cumcount() + 1
+        return ExpressionQuery(marker_genes=selected, evidence=evidence.loc[:, CASSIA_MARKER_COLUMNS])
 
     def _generate_gptcelltype_query(self, *, marker_genes: Any, **kwargs: Any) -> ExpressionQuery:
         if kwargs:
             raise TypeError("gptcelltype does not accept expression export options")
         return ExpressionQuery(marker_genes=marker_genes, evidence=marker_genes.loc[:, ["gene"]].copy())
+
+    def _generate_anndict_query(self, *, marker_genes: Any, **kwargs: Any) -> ExpressionQuery:
+        """Expose ordered marker genes through AnnDictionary's explicit profile.
+
+        AnnDictionary consumes the same label-free marker lists as other
+        marker-only callers, but retains a dedicated generator so its
+        benchmark protocol is explicit rather than coupled to GPTCelltype.
+        """
+        if kwargs:
+            raise TypeError("anndict does not accept expression export options")
+        required = {"group", "rank", "gene"}
+        missing = required.difference(marker_genes.columns)
+        if missing:
+            raise ValueError("AnnDictionary marker table lacks required columns: " + ", ".join(sorted(missing)))
+        return ExpressionQuery(marker_genes=marker_genes, evidence=marker_genes.loc[:, ["gene"]].copy())
+
+    def _generate_cellclick_v4_query(
+        self,
+        *,
+        marker_genes: Any,
+        groupby: str,
+        output_path: str | Path,
+        source_row_id_by_group: Mapping[str, str],
+        manifest_path: str | Path | None = None,
+        manifest_schema_version: str = "cellclick.expression.2",
+    ) -> ExpressionQuery:
+        """Save CellClick V4's label-free queryable AnnData and manifest.
+
+        V4 deliberately stores the selected AnnData instead of materializing
+        a full cluster-by-gene statistics table.  Later trusted tool calls can
+        calculate statistics only for genes requested during verification.
+        ``source_row_id_by_group`` binds the marker-ranking groups to the
+        benchmark rows without deriving IDs from annotations.
+        """
+        required = {"group", "rank", "gene"}
+        missing = required.difference(marker_genes.columns)
+        if missing:
+            raise ValueError("CellClick V4 marker table lacks required columns: " + ", ".join(sorted(missing)))
+        if groupby not in self.adata.obs:
+            raise KeyError(f"adata.obs lacks requested grouping column {groupby!r}")
+        if not isinstance(source_row_id_by_group, Mapping):
+            raise TypeError("source_row_id_by_group must be a mapping")
+        if not isinstance(manifest_schema_version, str) or not manifest_schema_version.strip():
+            raise ValueError("manifest_schema_version must be a non-empty string")
+
+        groups = sorted({str(group) for group in marker_genes["group"]})
+        normalized_mapping = {str(group): str(source_row_id).strip() for group, source_row_id in source_row_id_by_group.items()}
+        if set(normalized_mapping) != set(groups):
+            raise ValueError("CellClick V4 source-row mapping must exactly match marker groups")
+        if any(not source_row_id for source_row_id in normalized_mapping.values()):
+            raise ValueError("CellClick V4 source-row mapping contains an empty source_row_id")
+        if len(set(normalized_mapping.values())) != len(normalized_mapping):
+            raise ValueError("CellClick V4 source-row mapping contains duplicate source_row_id values")
+
+        try:
+            import anndata as ad
+            import pandas as pd
+        except (ImportError, ValueError) as error:
+            raise RuntimeError("CellClick V4 expression export requires anndata and pandas") from error
+
+        output_ids = self._marker_output_ids(groupby)
+        source_group_by_marker_group: dict[str, str] = {}
+        for marker_group in groups:
+            if marker_group in output_ids:
+                source_group_by_marker_group[marker_group] = marker_group
+                continue
+            source_groups = [source for source, output_id in output_ids.items() if output_id == marker_group]
+            if len(source_groups) != 1:
+                raise ValueError(f"CellClick V4 marker group {marker_group!r} cannot be bound to {groupby!r}")
+            source_group_by_marker_group[marker_group] = source_groups[0]
+        if set(source_group_by_marker_group.values()) != set(output_ids):
+            raise ValueError("CellClick V4 marker groups do not cover the submitted expression groups")
+
+        anonymous_by_marker_group = {
+            marker_group: f"G{index:03d}" for index, marker_group in enumerate(sorted(groups), start=1)
+        }
+        source_labels = self.adata.obs[groupby].astype(str)
+        group_to_anonymous = {
+            source_group_by_marker_group[marker_group]: anonymous_by_marker_group[marker_group]
+            for marker_group in groups
+        }
+        anonymous_labels = source_labels.map(group_to_anonymous)
+        if anonymous_labels.isna().any():
+            raise ValueError("CellClick V4 could not anonymize every expression cell group")
+        statistics = self.adata.layers[NORMALIZED_LOG_LAYER]
+        cell_ids = [f"cell_{index:09d}" for index in range(self.adata.n_obs)]
+        export = ad.AnnData(
+            X=statistics.copy(),
+            obs=pd.DataFrame({"cellclick_group_id": anonymous_labels.to_numpy()}, index=cell_ids),
+            var=pd.DataFrame(index=self.adata.var_names.astype(str).copy()),
+        )
+        export.layers[NORMALIZED_LOG_LAYER] = statistics.copy()
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        export.write_h5ad(destination)
+        resolved_destination = destination.resolve()
+        resolved_manifest = (
+            Path(manifest_path) if manifest_path is not None
+            else destination.with_suffix(".manifest.json")
+        )
+        resolved_manifest.parent.mkdir(parents=True, exist_ok=True)
+
+        initial_markers: dict[str, list[str]] = {}
+        for group, group_rows in marker_genes.groupby("group", sort=True):
+            source_row_id = normalized_mapping[str(group)]
+            initial_markers[source_row_id] = (
+                group_rows.sort_values("rank", kind="stable")["gene"].astype(str).tolist()
+            )
+        manifest = {
+            "schema_version": manifest_schema_version.strip(),
+            "h5ad_path": str(resolved_destination),
+            "source_h5ad_path": str(Path(self._source_data).resolve()) if isinstance(self._source_data, (str, Path)) else None,
+            "source_h5ad_sha256": _sha256_file(self._source_data) if isinstance(self._source_data, (str, Path)) else None,
+            "groupby": "cellclick_group_id",
+            "statistics_layer": NORMALIZED_LOG_LAYER,
+            "source_row_id_by_group": {
+                anonymous_by_marker_group[marker_group]: normalized_mapping[marker_group]
+                for marker_group in sorted(groups)
+            },
+            "initial_markers_by_source_row_id": initial_markers,
+        }
+        resolved_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return ExpressionQuery(marker_genes=marker_genes, evidence=manifest)
 
     def _generate_celltypeagent_query(
         self,

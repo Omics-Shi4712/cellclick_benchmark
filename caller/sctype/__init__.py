@@ -1,0 +1,1 @@
+"""ScType benchmark caller."""

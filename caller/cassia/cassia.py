@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from typing import Any
 STANDARD_FIELDS = ("source_row_id", "dataset", "tissue", "prediction", "method", "model", "task_id")
 _FINAL_TAG = re.compile(r"<FINAL_ANNOTATION>\s*(.*?)\s*</FINAL_ANNOTATION>", re.IGNORECASE | re.DOTALL)
 _LABEL_LINE = re.compile(
-    r"(?:final\s+(?:cell\s+type|annotation)|cell\s+type)\s*(?::|\-|\bis\b)\s*([^\n.]+)",
+    r"(?:final\s+(?:cell\s+type|annotation)|cell\s+type)(?:\s*[*_]{1,3})?\s*(?::|\-|\bis\b)\s*([^\n.]+)",
     re.IGNORECASE,
 )
 
@@ -42,6 +43,10 @@ def provider_from_environment(config: dict[str, Any]) -> str:
         if not api_key:
             raise EnvironmentError("OPENAI_API_KEY is required with OPENAI_BASE_URL")
         os.environ["CUSTOMIZED_API_KEY"] = api_key
+        # CASSIA passes custom providers directly to the OpenAI client.  Keep
+        # only the API base path; passing a full endpoint makes the client
+        # append /chat/completions twice on some relay versions.
+        base_url = re.sub(r"/chat/completions/?$", "", base_url)
         return base_url.rstrip("/")
     if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
         raise EnvironmentError("OPENAI_API_KEY is required for CASSIA provider=openai")
@@ -97,6 +102,52 @@ def _native_scores(scored_path: Path, expected_ids: set[str]) -> dict[str, float
     return scores
 
 
+def _alignment_error(kind: str, observed: set[str], expected: set[str]) -> ValueError:
+    missing = sorted(expected - observed)
+    extra = sorted(observed - expected)
+    details = []
+    if missing:
+        details.append(f"missing={missing}")
+    if extra:
+        details.append(f"extra={extra}")
+    suffix = f" ({'; '.join(details)})" if details else ""
+    return ValueError(f"CASSIA {kind} does not align one-to-one with the query{suffix}")
+
+
+def _run_expression_pipeline(pipeline: Any, arguments: dict[str, Any], rows: list[dict[str, str]]) -> None:
+    """Submit ordered query markers directly; retain full statistics for Boost.
+
+    Re-filtering the benchmark query as a Seurat DE table can remove entire
+    clusters. Use CASSIA's supported preformatted input for initial annotation.
+    The full table remains the pipeline input used by Boost.
+    """
+    engine = importlib.import_module("CASSIA.engine.tools_function")
+    original_batch = engine.runCASSIA_batch
+    allowed = {
+        row["source_row_id"]: {gene.strip() for gene in row["marker"].split(",") if gene.strip()}
+        for row in rows
+    }
+
+    def initial_batch(*args: Any, **kwargs: Any) -> Any:
+        frame = kwargs["marker"]
+        clusters = frame["cluster"].astype(str)
+        unknown = set(clusters).difference(allowed)
+        if unknown:
+            raise ValueError(f"CASSIA initial marker table contains unknown clusters: {sorted(unknown)}")
+        import pandas as pd
+        kwargs["marker"] = pd.DataFrame({
+            "cluster": [row["source_row_id"] for row in rows],
+            "markers": [row["marker"] for row in rows],
+        })
+        return original_batch(*args, **kwargs)
+
+    engine.runCASSIA_batch = initial_batch
+    try:
+        pipeline(**arguments)
+    finally:
+        engine.runCASSIA_batch = original_batch
+
+
 def run_task(task: dict[str, Any]) -> None:
     rows = read_query(Path(task["query_tsv"]))
     config = task.get("method_config", {})
@@ -127,19 +178,32 @@ def run_task(task: dict[str, Any]) -> None:
 
     provider = provider_from_environment(config)
     model = str(config.get("model", "gpt-4o-2024-08-06"))
+    configured_workers = int(config.get("max_workers", 4))
     pipeline_args: dict[str, Any] = {
         "output_file_name": "cassia", "output_dir": str(work_dir), "marker": marker_frame,
         "tissue": rows[0]["tissue"], "species": species.strip(), "overall_provider": provider,
         "annotation_model": model, "annotation_provider": provider,
         "score_model": str(config.get("score_model", model)), "score_provider": str(config.get("score_provider", provider)),
-        "score_threshold": float(config.get("score_threshold", 75)), "max_workers": int(config.get("max_workers", 4)),
+        "score_threshold": float(config.get("score_threshold", 75)), "max_workers": max(1, configured_workers),
         "max_retries": int(config.get("max_retries", 2)), "validator_involvement": str(config.get("validator_involvement", "v1")),
         "auto_convert_ids": bool(config.get("auto_convert_ids", False)),
     }
+    reasoning = config.get("reasoning")
+    if reasoning is not None:
+        reasoning = str(reasoning).strip().lower()
+        if reasoning not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("CASSIA reasoning must be one of none, minimal, low, medium, high, xhigh, max")
+        pipeline_args["overall_reasoning"] = {"effort": reasoning}
     for name in ("annotationboost_model", "annotationboost_provider", "merge_model", "merge_provider"):
         if config.get(name) is not None:
             pipeline_args[name] = str(config[name])
-    CASSIA.runCASSIA_pipeline(**pipeline_args)
+    if marker_file:
+        pipeline_args["n_genes"] = max(
+            len([gene for gene in row["marker"].split(",") if gene.strip()]) for row in rows
+        )
+        _run_expression_pipeline(CASSIA.runCASSIA_pipeline, pipeline_args, rows)
+    else:
+        CASSIA.runCASSIA_pipeline(**pipeline_args)
 
     pipeline_dir = _pipeline_directory(work_dir)
     csv_dir = pipeline_dir / "03_csv_files"
@@ -149,7 +213,7 @@ def run_task(task: dict[str, Any]) -> None:
     initial = _by_cluster(_read_csv(summary_path), summary_path)
     expected_ids = {row["source_row_id"] for row in rows}
     if set(initial) != expected_ids:
-        raise ValueError("CASSIA summary does not align one-to-one with the query")
+        raise _alignment_error("summary", set(initial), expected_ids)
     scores, threshold = _native_scores(scored_path, expected_ids), float(config.get("score_threshold", 75))
 
     lineage: list[dict[str, str]] = []

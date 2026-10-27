@@ -77,6 +77,28 @@ class CLSolver:
             return set()
         return {cl_id, *nx.descendants(self.cl_graph, cl_id)}
 
+    def get_children(self, parent_id: str) -> list[dict[str, str]]:
+        """Return direct ``is_a`` children of ``parent_id``.
+
+        The graph is directed child -> parent, so direct children are the
+        predecessors of the requested parent.  Results are deterministic and
+        include only the labels needed by the subtype catalog contract.
+        """
+        if parent_id not in self.cl_graph:
+            return []
+        parent_label = self.cl_graph_raw.nodes[parent_id].get("name", parent_id)
+        children = []
+        for child_id in sorted(self.cl_graph.predecessors(parent_id)):
+            children.append({
+                "cl_id": child_id,
+                "label": self.cl_graph_raw.nodes[child_id].get("name", child_id),
+                "parent_id": parent_id,
+                "parent_label": parent_label,
+            })
+        return children
+
+    get_subtypes = get_children
+
     def get_path_to_ancestor(
         self, child_id: str, ancestor_id: str
     ) -> Optional[list[dict[str, str]]]:
@@ -106,26 +128,7 @@ class CLSolver:
         are numbers of ``is_a`` edges.  Unknown or disconnected IDs return
         ``None``.
         """
-        if first_id not in self.cl_graph or second_id not in self.cl_graph:
-            return None
-
-        first_ancestors = self.get_ancestors(first_id)
-        second_ancestors = self.get_ancestors(second_id)
-        common_parents = first_ancestors & second_ancestors
-        results: list[dict[str, Any]] = []
-
-        for parent_id in common_parents:
-            first_distance = nx.shortest_path_length(self.cl_graph, first_id, parent_id)
-            second_distance = nx.shortest_path_length(self.cl_graph, second_id, parent_id)
-            results.append(
-                {
-                    "cl_id": parent_id,
-                    "label": self.cl_graph_raw.nodes[parent_id].get("name", parent_id),
-                    "distance_first": first_distance,
-                    "distance_second": second_distance,
-                    "average_distance": (first_distance + second_distance) / 2,
-                }
-            )
+        results = self.get_common_ancestor_candidates(first_id, second_id)
 
         if not results:
             return None
@@ -137,6 +140,37 @@ class CLSolver:
                 item["cl_id"],
             ),
         )
+
+    def get_common_ancestor_candidates(
+        self, first_id: str, second_id: str
+    ) -> list[dict[str, Any]]:
+        """Return every common ancestor with shortest upward distances.
+
+        Candidate enumeration is kept score-neutral so scorers can apply
+        their own distance and branch penalties. Results are sorted by CL ID
+        to remain deterministic.
+        """
+        if first_id not in self.cl_graph or second_id not in self.cl_graph:
+            return []
+
+        common_ancestors = self.get_ancestors(first_id) & self.get_ancestors(second_id)
+        results: list[dict[str, Any]] = []
+        for ancestor_id in sorted(common_ancestors):
+            first_distance = nx.shortest_path_length(self.cl_graph, first_id, ancestor_id)
+            second_distance = nx.shortest_path_length(self.cl_graph, second_id, ancestor_id)
+            distance = first_distance + second_distance
+            results.append(
+                {
+                    "cl_id": ancestor_id,
+                    "label": self.cl_graph_raw.nodes[ancestor_id].get("name", ancestor_id),
+                    "distance_first": first_distance,
+                    "distance_second": second_distance,
+                    "distance": distance,
+                    "branch_distance": min(first_distance, second_distance),
+                    "average_distance": distance / 2,
+                }
+            )
+        return results
 
     # Common terminology for ontology ancestry.
     get_common_ancestors = get_common_parents

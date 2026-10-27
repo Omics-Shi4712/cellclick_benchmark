@@ -142,7 +142,7 @@ def _write_evaluations(
     return one_file, aggregate_file
 
 
-def run(config, adapter, queries, callers, config_path, output_dir, *, resume: bool = False):
+def run(config, adapter, queries, callers, config_path, output_dir, *, resume: bool = False, force: bool = False, max_parallel_tasks: int = 1):
     """Run GPTCelltype, score it, and compare the result to a reference."""
     from runner.run import (
         collect_validated_predictions, config_digest, execute_tasks, initialize_output,
@@ -159,11 +159,12 @@ def run(config, adapter, queries, callers, config_path, output_dir, *, resume: b
         references = _reference_predictions(
             reference_file, queries, getattr(adapter, "top_n", None),
         )
-        manifest = initialize_output(output_dir, config_digest(config_path), resume=resume)
+        manifest = initialize_output(output_dir, config_digest(config_path), resume=resume, force=force)
         conda_executable = str(config.get("run", {}).get("conda_executable", "conda"))
         failures = execute_tasks(
             adapter, queries, {name: settings}, output_dir, config_path, conda_executable,
-            manifest, resume=resume,
+            manifest, resume=resume, force=force,
+            max_parallel_tasks=max_parallel_tasks,
         )
         if failures:
             raise RuntimeError(f"gptcelltype test failed for {failures} task(s); see {output_dir / 'manifest.json'}")

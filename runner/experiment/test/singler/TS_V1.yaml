@@ -1,0 +1,30 @@
+# Paper algorithm, partial coverage: 24 existing tissues / 375 populations.
+# Use --mode run or expression/call/evaluate; --mode test is not implemented.
+run:
+  output_dir: ../../../../runs/singler/TS_V1
+  conda_executable: conda
+
+data:
+  expressionAdapter:
+    enabled: true
+    environment: cellclick
+    metadata_file: ../../../../data/expression_data/h5ad_metadata.json
+    datasets: [TS_V1]
+    marker_statistics_root: ../../../../data/expression_data
+    target_sum: 10000
+    marker_method: wilcoxon-seurat
+    marker_top_n: 10
+    marker_method_parameters: {}
+    skip_marker_gene: true
+
+callers:
+  singler:
+    implementation: singler
+    enabled: true
+    environment: singler
+    hpca_rds: ../../../../src/singler/HPCA_celldex1.0.0.rds
+    num_workers: 1
+    save_fullpred: true
+
+evaluation:
+  type: celltypegpt
